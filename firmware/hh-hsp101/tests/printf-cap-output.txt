@@ -1,0 +1,1 @@
+PENGAN_TELEMETRY {"schemaVersion":1,"deviceId":"hh-hsp101-001","simulated":false,"uptime_ms":4294967295,"th_ok":true,"temperature10":-500,"humidity10":1000,"gas_ok":true,"gas_raw":4095,"gas_mv":7200,"th_sample_age_ms":4294967295,"gas_sample_age_ms":4294967295,"coValid":false,"co2Valid":false,"coPpm":null,"co2Ppm":null,"controlSupported":false}

@@ -1,0 +1,30 @@
+{
+  "hardwareReason": "telemetry_stale",
+  "hardwareOnline": false,
+  "model": {
+    "configured": false,
+    "provider": null,
+    "model": null,
+    "executesDevices": false,
+    "imageAnalysis": true,
+    "workspaceId": "",
+    "mode": "hardware"
+  },
+  "health": {
+    "ok": true,
+    "mode": "hardware",
+    "simulated": false,
+    "transport": "serial-http",
+    "hardwareConnected": false
+  },
+  "realModelInvoked": false,
+  "checkedAt": "2026-10-31T15:45:04.2440103+08:00",
+  "historyStorage": {
+    "enabled": true,
+    "healthy": true,
+    "records": 0,
+    "bytes": 0,
+    "maxBytes": 67108864,
+    "simulated": false
+  }
+}

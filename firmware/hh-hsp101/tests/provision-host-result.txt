@@ -1,0 +1,7 @@
+2026-11-01
+gcc -std=c99 -Wall -Wextra -Werror tests/provision_test.c
+provision routing/parser/credential-redaction/torn-write-recovery PASS
+SDK scons BUILD SUCCESS
+Physical Wi-Fi/OLED/flash acceptance: pending
+OLED PASS (actual render with Wi-Fi SDK stubs): state/address/hotspot 3-phase, guarded bounds and no overlap
+SCHEDULE PASS / SOURCE CONTRACT PASS

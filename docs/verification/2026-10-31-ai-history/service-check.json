@@ -1,0 +1,27 @@
+{
+  "health": {
+    "ok": true,
+    "mode": "hardware",
+    "simulated": false,
+    "transport": "serial-http",
+    "hardwareConnected": false
+  },
+  "model": {
+    "configured": false,
+    "provider": null,
+    "model": null,
+    "executesDevices": false,
+    "imageAnalysis": true,
+    "workspaceId": "",
+    "mode": "hardware"
+  },
+  "aiHistory": {
+    "enabled": true,
+    "healthy": true,
+    "records": 0,
+    "bytes": 0,
+    "maxBytes": 16777216
+  },
+  "realModelInvoked": false,
+  "checkedAt": "2026-10-31T17:08:49.9426721+08:00"
+}

@@ -1,0 +1,47 @@
+[
+  {
+    "text": "模拟一氧化碳超标，禁止入棚。请先通风，再复测。",
+    "bytes": 225760,
+    "sha256": "d5724903b877c013b323ddb32dca07ba861ba876b0815758b69dba048f1a0593",
+    "file": "co_high.pcm",
+    "bits": 16,
+    "sampleRate": 16000,
+    "channels": 1
+  },
+  {
+    "text": "模拟二氧化碳超标，禁止入棚。请先通风，再复测。",
+    "bytes": 227200,
+    "sha256": "bc87fd6ef5878ca792366ffe94288075c044406c1051e29e202a0b7889b15259",
+    "file": "co2_high.pcm",
+    "bits": 16,
+    "sampleRate": 16000,
+    "channels": 1
+  },
+  {
+    "text": "模拟传感数据不可用，禁止入棚。请检查设备连接。",
+    "bytes": 215840,
+    "sha256": "07cc08f79118ffae7f4dd8627eeb5479965a44f93b7a2b2d8a18d6387e13790f",
+    "file": "sensor_invalid.pcm",
+    "bits": 16,
+    "sampleRate": 16000,
+    "channels": 1
+  },
+  {
+    "text": "急停已触发，模拟执行器停止。请检查现场。",
+    "bytes": 202240,
+    "sha256": "87cab59e175b873dc86d4f467c2705f2682e8798450eb2bfbe0f5e0a525e3dcb",
+    "file": "emergency.pcm",
+    "bits": 16,
+    "sampleRate": 16000,
+    "channels": 1
+  },
+  {
+    "text": "棚安演示语音已就绪。当前为模拟模式。",
+    "bytes": 173120,
+    "sha256": "6b05f7fd565308f728f463bcb7c5d86e585dfc4d4a5ace3cc5f814b407666339",
+    "file": "voice_test.pcm",
+    "bits": 16,
+    "sampleRate": 16000,
+    "channels": 1
+  }
+]

@@ -1,0 +1,9 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>棚安 · 智慧大棚工作台</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<aside class="sidebar"><a class="brand" href="#home"><span class="brand-icon">棚</span><div>棚安<small>PENGAN / 智慧农业</small></div></a><div class="workspace">示范棚区 <span>01</span></div><nav id="nav"><button data-page="home" class="active">◫ <span>环境态势</span></button><button data-page="agent">✧ <span>智能助手</span></button><button data-page="tasks">☷ <span>任务中心</span><b id="task-count">0</b></button><button data-page="monitor">▣ <span>作物巡查</span></button><button data-page="audit">▤ <span>审计台账</span></button></nav><div class="sidebar-bottom"><div><i class="dot"></i> 本地演示运行中</div><small>DAYU200 + HH-HSP 接入待开发</small><p>原型版本 0.1</p></div></aside>
+<main><header><div class="breadcrumb">棚区管理 <span>/</span> <strong id="page-name">环境态势</strong></div><div class="header-right"><span id="clock"></span><span class="avatar">管</span><span>演示管理员</span></div></header>
+<div class="demo-banner"><span><b>交互原型 · 模拟数据</b>　未连接开发板、云端模型或真实门禁</span><button id="demo-toggle">演示控制台 <span>⌄</span></button></div>
+<section class="demo-controls" id="demo-controls" hidden><div><strong>模拟场景</strong><small>所有阈值均为演示参数，不用于真实准入判定</small></div><button data-scenario="normal">正常环境</button><button data-scenario="co">CO 超标</button><button data-scenario="co2">CO₂ 超标</button><button data-scenario="stale">读数过期</button><button id="cloud-toggle">断开模拟云端</button><button id="sensor-toggle">断开模拟终端</button><button id="emergency" class="danger-button">触发急停</button><button id="reset">重置演示</button></section>
+<div id="content"></div><footer><span>棚安 / 让每一次入棚都有据可依</span><span>本地安全规则优先 · AI 执行须经规则校验</span></footer></main><div id="toast" role="status" aria-live="polite"></div>
+<script type="module" src="app.js"></script></body></html>

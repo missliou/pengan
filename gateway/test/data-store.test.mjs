@@ -1,0 +1,66 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp,rm,writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {tmpdir} from 'node:os';
+import {createHash} from 'node:crypto';
+import {DataStore} from '../data-store.mjs';
+import {CloudSecurity} from '../cloud-security.mjs';
+import {startCloudServer} from '../cloud-server.mjs';
+const png='iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jHDsAAAAASUVORK5CYII=';
+const body=(category='crop')=>({category,label:'synthetic software test',capturedAt:1000,base64:png,authorized:true});
+const context={gatewayId:'dayu-a',actor:'admin',role:'admin'};
+test('SQLite history backfill, indexed pagination and restart preserve ordering',async t=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'pengan-db-'));let store;t.after(async()=>{await store?.close();await rm(dir,{recursive:true,force:true});});
+ const rows=[1,2,3].map(seq=>({seq,kind:'telemetry',gatewayId:seq===2?'dayu-b':'dayu-a',recordedAt:seq,hash:String(seq),data:{testOnly:true}}));
+ store=await new DataStore({directory:dir}).open(rows);assert.equal(store.status().historyRecords,3);
+ const first=store.queryHistory({kind:'telemetry',gatewayId:'dayu-a',limit:1});assert.equal(first.items[0].seq,3);assert.equal(first.nextBeforeSeq,3);
+ assert.equal(store.queryHistory({kind:'telemetry',gatewayId:'dayu-a',beforeSeq:3}).items[0].seq,1);
+ await store.close();store=await new DataStore({directory:dir}).open(rows);assert.equal(store.status().historyRecords,3);
+ await assert.rejects(new DataStore({directory:dir}).open([]),/database_history_mismatch/);
+});
+test('images enforce authorization, identity, category visibility and file integrity',async t=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'pengan-images-'));const store=await new DataStore({directory:dir}).open();t.after(async()=>{await store.close();await rm(dir,{recursive:true,force:true});});
+ for(const change of [{authorized:false},{category:'face'},{base64:'PGh0bWw+'},{capturedAt:Date.now()+999999},{telemetrySeq:1},{base64:png,token:'not-allowed'}])await assert.rejects(store.upload({...body(),...change},context));
+ await assert.rejects(store.upload(body(),{...context,role:'viewer'}),/forbidden/);
+ const crop=await store.upload(body(),context),person=await store.upload(body('person'),context);
+ const first=await store.upload({...body(),uploadId:'retry-stable'},context),retry=await store.upload({...body(),uploadId:'retry-stable'},context);assert.equal(first.mediaId,retry.mediaId);
+ await assert.rejects(store.upload({...body(),uploadId:'retry-stable',label:'changed'},context),/media_upload_conflict/);
+ assert.equal(crop.width,1);assert.equal(person.category,'person');
+ assert.equal(store.list({...context,role:'viewer'}).items.length,2);
+ assert.throws(()=>store.detail(person.mediaId,'dayu-a','viewer'),/media_not_found/);
+ assert.throws(()=>store.detail(crop.mediaId,'dayu-b','admin'),/media_not_found/);
+ assert.deepEqual((await store.content(crop.mediaId,'dayu-a','viewer')).bytes,Buffer.from(png,'base64'));
+ await writeFile(path.join(dir,'images',crop.mediaId),'damaged');await assert.rejects(store.content(crop.mediaId,'dayu-a','admin'),/integrity/);
+});
+test('authenticated media HTTP upload/read, CSRF, device boundary and restart',async t=>{
+ const dir=await mkdtemp(path.join(tmpdir(),'pengan-media-http-'));let runtime;
+ t.after(async()=>{await runtime?.close();await rm(dir,{recursive:true,force:true});});
+ const password='synthetic-test-password-2026',passwordHash=await CloudSecurity.hashPassword(password),token='synthetic-device-token-0123456789',digest=createHash('sha256').update(token).digest('hex');
+ const options={dataDir:dir,publicOrigin:'http://127.0.0.1:0',users:[{username:'admin',role:'admin',passwordHash},{username:'reader',role:'viewer',passwordHash}],devices:[{gatewayId:'dayu-a',tokenSha256:digest},{gatewayId:'dayu-b',tokenSha256:digest}]};
+ const start=async()=>runtime=await startCloudServer(options);await start();
+ const req=(route,{method='GET',headers={},json}={})=>fetch(runtime.publicOrigin+route,{method,headers:{...headers,...(json?{'content-type':'application/json'}:{})},body:json?JSON.stringify(json):undefined});
+ const login=async username=>{const r=await req('/admin-api/session/login',{method:'POST',headers:{origin:runtime.publicOrigin},json:{username,password}});assert.equal(r.status,200);const session=await r.json();return {cookie:r.headers.get('set-cookie').split(';')[0],origin:runtime.publicOrigin,'x-pengan-csrf':session.csrfToken};};
+ const admin=await login('admin'),reader=await login('reader');
+ assert.equal((await req('/admin-api/media?gatewayId=dayu-a')).status,401);
+ assert.equal((await req('/admin-api/media?gatewayId=dayu-a',{method:'POST',headers:reader,json:body()})).status,403);
+ assert.equal((await req('/admin-api/media?gatewayId=dayu-a',{method:'POST',headers:{cookie:admin.cookie,origin:admin.origin},json:body()})).status,403);
+ const r=await req('/admin-api/media?gatewayId=dayu-a',{method:'POST',headers:admin,json:body('person')});assert.equal(r.status,201);const saved=await r.json(),id=saved.item.mediaId;
+ assert.equal((await req('/admin-api/media/'+id+'/content?gatewayId=dayu-a',{headers:reader})).status,404);
+ assert.equal((await req('/admin-api/media/'+id+'/content?gatewayId=dayu-b',{headers:admin})).status,404);
+ const image=await req('/admin-api/media/'+id+'/content?gatewayId=dayu-a',{headers:admin});assert.equal(image.headers.get('content-type'),'image/png');assert.equal(image.headers.get('cache-control'),'no-store');assert.deepEqual(Buffer.from(await image.arrayBuffer()),Buffer.from(png,'base64'));
+ const device=await req('/api/v1/device/media',{method:'POST',headers:{authorization:'Bearer '+token,'x-pengan-gateway-id':'dayu-b'},json:body()});assert.equal(device.status,201);
+ const deviceList=await (await req('/admin-api/media?gatewayId=dayu-b',{headers:admin})).json();assert.equal(deviceList.items.length,1);assert.equal(deviceList.items[0].gatewayId,'dayu-b');
+ await runtime.close();await start();const after=await login('admin');assert.equal((await (await req('/admin-api/media?gatewayId=dayu-a',{headers:after})).json()).items[0].mediaId,id);
+ const status=await (await req('/admin-api/storage',{headers:after})).json();assert.equal(status.images,2);assert.equal(status.engine,'sqlite');
+ assert.ok(runtime.history.rows.every(row=>!JSON.stringify(row).includes(png)));
+});
+
+test('SQLite v1 media migration preserves stored images and adds idempotent upload keys',async t=>{
+ const {DatabaseSync}=await import('node:sqlite');const dir=await mkdtemp(path.join(tmpdir(),'pengan-db-migrate-'));let store;
+ t.after(async()=>{await store?.close();await rm(dir,{recursive:true,force:true});});
+ store=await new DataStore({directory:dir}).open();const saved=await store.upload(body(),context);await store.close();
+ const old=new DatabaseSync(path.join(dir,'records.sqlite'));old.exec('DROP INDEX media_upload_key; ALTER TABLE media DROP COLUMN upload_id; PRAGMA user_version=1;');old.close();
+ store=await new DataStore({directory:dir}).open();assert.equal(store.status().schemaVersion,2);assert.equal(store.detail(saved.mediaId,'dayu-a','admin').sha256,saved.sha256);
+ assert.deepEqual((await store.content(saved.mediaId,'dayu-a','admin')).bytes,Buffer.from(png,'base64'));
+});

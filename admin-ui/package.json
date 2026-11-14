@@ -1,0 +1,17 @@
+{
+  "name": "pengan-admin-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "棚安 Ubuntu 云端 Web 管理平台前端（独立，不嵌入 DAYU200 HAP）。零运行时依赖的原生 ES Module 单页应用。",
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "serve": "node serve.mjs",
+    "dev": "node serve.mjs",
+    "build": "node build.mjs",
+    "start": "node serve.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

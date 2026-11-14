@@ -1,0 +1,1 @@
+Derived from local hi3861-dashboard-v1.2.0-review. Parent project Apache-2.0 LICENSE copied; SDK/source copyright notices retained. Modifications 2026-10-30: read-only telemetry, OLED heartbeat, no NFC writes/music, control routes removed. Real hardware acceptance pending.

@@ -1,0 +1,14 @@
+tmp/
+node_modules/
+**/.hvigor/
+**/oh_modules/
+**/build/
+**/local.properties
+*.p12
+*.p7b
+*.cer
+.env
+**/cloud-config.json
+**/device-credential.json
+**/model-config.json
+**/cloud-writer.lock

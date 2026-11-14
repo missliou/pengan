@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "entry_app_name",
+      "value": "棚安"
+    },
+    {
+      "name": "module_desc",
+      "value": "智慧大棚安全与作物巡查原型"
+    },
+    {
+      "name": "camera_reason",
+      "value": "用于用户主动发起的作物本地预览与抓拍，图片不自动上传"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于用户主动录音并转换为可确认的文字问题"
+    }
+  ]
+}

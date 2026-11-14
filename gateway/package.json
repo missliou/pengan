@@ -1,0 +1,1 @@
+{"name":"pengan-device-gateway","version":"0.1.0","type":"module","private":true,"scripts":{"demo":"node demo.mjs","test":"node --test test/*.test.mjs"},"dependencies":{"aedes":"1.2.0","mqtt":"5.16.1"}}

@@ -1,0 +1,11 @@
+{
+  "sourceSha256": "3e497a48ef9737b92661fd09cdf151f02e0b21ac7896b1595a39876f346fabbd",
+  "frameCount": 5,
+  "nativeSize": [
+    128,
+    64
+  ],
+  "animatedFrameDelayMs": 250,
+  "devicePhotograph": false,
+  "sensorInputs": "synthetic host test values"
+}
