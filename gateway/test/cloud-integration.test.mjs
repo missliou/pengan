@@ -12,20 +12,24 @@ import {CloudSecurity} from '../cloud-security.mjs';
 import {startCloudServer} from '../cloud-server.mjs';
 const token='only_a_test_device_token_01234567890123456789',tokenB='only_b_test_device_token_01234567890123456789';
 const digest=s=>createHash('sha256').update(s).digest('hex');
-function nativeUploader(port){
+function nativeServices(port){
  const root=fileURLToPath(new URL('../../',import.meta.url)),require=createRequire(import.meta.url);
  const ts=require(path.join(root,'openharmony/node_modules/@ohos/hvigor/node_modules/typescript/lib/typescript.js')),cache=new Map();
+ const localOrigin='http://127.0.0.1:'+port,store=new Map();
+ const preferences={getPreferences:async()=>({get:async(key,fallback)=>store.get(key)??fallback,put:async(key,value)=>store.set(key,value),flush:async()=>{}})};
  const http={RequestMethod:{POST:'POST',GET:'GET'},HttpDataType:{STRING:0},createHttp:()=>({async request(url,options){
-  assert.ok(url.startsWith('https://cloud.test/')); // Explicit host-only TLS adapter, not real TLS acceptance.
-  const response=await fetch('http://127.0.0.1:'+port+url.slice('https://cloud.test'.length),{method:options.method,headers:options.header,body:options.extraData});return {responseCode:response.status,result:await response.text()};
+  assert.ok(url.startsWith('https://cloud.test/')||url.startsWith(localOrigin+'/'));
+  const response=await fetch(url.replace(/^https:\/\/cloud\.test/,localOrigin),{method:options.method,headers:options.header,body:options.extraData});return {responseCode:response.status,result:await response.text()};
  },destroy(){}})};
  const load=file=>{if(cache.has(file))return cache.get(file).exports;const module={exports:{}};cache.set(file,module);
   const code=ts.transpileModule(readFileSync(file,'utf8'),{compilerOptions:{target:ts.ScriptTarget.ES2020,module:ts.ModuleKind.CommonJS}}).outputText;
-  const scoped=name=>name==='@ohos.net.http'?{default:http}:name==='@ohos.util'?{default:{TextEncoder:class{encodeInto(s){return new TextEncoder().encode(s);}}}}:name==='@ohos.data.preferences'?{default:{}}:name.startsWith('.')?load(path.resolve(path.dirname(file),name+'.ets')):(()=>{throw Error('unmocked dependency');})();
+  const scoped=name=>name==='@ohos.net.http'?{default:http}:name==='@ohos.util'?{default:{TextEncoder:class{encodeInto(s){return new TextEncoder().encode(s);}}}}:name==='@ohos.data.preferences'?{default:preferences}:name.startsWith('.')?load(path.resolve(path.dirname(file),name+'.ets')):(()=>{throw Error('unmocked dependency');})();
   vm.runInThisContext('(function(require,module,exports){'+code+'\n})',{filename:file})(scoped,module,module.exports);return module.exports;
  };
- return new (load(path.join(root,'openharmony/entry/src/main/ets/services/CloudUpload.ets')).CloudUpload)();
+ const services=path.join(root,'openharmony/entry/src/main/ets/services');
+ return {client:new (load(path.join(services,'CloudUpload.ets')).CloudUpload)(),Queue:load(path.join(services,'OfflineQueue.ets')).OfflineQueue};
 }
+const nativeUploader=port=>nativeServices(port).client;
 const upload=(gatewayId='dayu-a',uptime=100,temperature10=256)=>({schemaVersion:1,gatewayId,sessionBootId:'test-boot',sampleAgeMs:100,frame:{schemaVersion:1,deviceId:'hh-hsp101-001',simulated:false,controlSupported:false,coValid:false,co2Valid:false,coPpm:null,co2Ppm:null,uptime_ms:uptime,th_ok:true,gas_ok:true,temperature10,humidity10:638,gas_raw:1234,gas_mv:3210,th_sample_age_ms:100,gas_sample_age_ms:100}});
 test('Web manual crop review -> actual ArkTS authenticated inbox, crop-only and cross-device isolation',async t=>{
  const h=await setup(t),admin=await h.login();
@@ -97,6 +101,33 @@ test('actual native upload service -> real HTTP server -> model stub -> authenti
  const analysis=await client.analyze('native integration test',b.sessionBootId);assert.equal(analysis.persistence.saved,true);
  const history=await (await h.request('/api/agent/history?gatewayId=dayu-a',{headers:admin})).json();assert.equal(history.items[0].prompt,'native integration test');
  client.clear();await assert.rejects(client.analyze('test',b.sessionBootId),/未配置/);
+});
+
+test('native general agriculture answer shares only the question even when cloud telemetry is fresh',async t=>{
+ const h=await setup(t),admin=await h.login(),client=nativeUploader(h.runtime.port);
+ await h.request('/api/agent/config',{body:{provider:'deepseek',model:'deepseek-chat',key:'test-key-only'},headers:admin});
+ await h.request('/api/v1/telemetry/current',{body:upload(),headers:h.deviceHeaders()});
+ client.configure('https://cloud.test','dayu-a',token);
+ const question='synthetic crop-care question';
+ const analysis=await client.analyze(question,'',true);
+ assert.equal(analysis.generalOnly,true);assert.equal(analysis.observationReceivedAt,null);assert.equal(analysis.observation,null);
+ assert.deepEqual(JSON.parse(h.modelRequests.at(-1).messages[1].content),{request:question});
+ assert.deepEqual(h.modelRequests.at(-1).tools.map(t=>t.function.name),['analyze_observations']);
+ const history=await client.readHistory('analysis');assert.match(history.rows[0],/未使用现场读数或历史/);
+});
+
+test('local HTTP demo uses the real ArkTS queue and uploads telemetry visible in the Web session',async t=>{
+ const h=await setup(t),admin=await h.login(),{client,Queue}=nativeServices(h.runtime.port);
+ client.configure(h.runtime.publicOrigin,'dayu-a',token);
+ const q=new Queue();await q.open({});
+ const body=upload(),sample={sessionBootId:body.sessionBootId,sampleAgeMs:body.sampleAgeMs,frameJson:JSON.stringify(body.frame)};
+ await assert.rejects(q.enqueue(sample,'http://public.example|dayu-a'),/无效/);
+ const target=client.queueTarget(),key=await q.enqueue(sample,target);
+ const reopened=new Queue();await reopened.open({});assert.equal(reopened.batch(target).length,1);
+ assert.match(await client.upload(sample),/确认接收/);
+ await reopened.acknowledge(target,[key]);assert.equal(reopened.count(),0);
+ const response=await h.request('/api/observations?gatewayId=dayu-a',{headers:admin});
+ const observation=await response.json();assert.equal(response.status,200);assert.equal(observation.hardware.values.temperatureC,25.6);
 });
 
 // Both real device-history endpoints are consumed by the actual ArkTS service.

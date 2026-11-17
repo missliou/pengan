@@ -58,6 +58,20 @@ test('direct settings default to unconfigured local collection, normalize bare p
   assert.equal(saved.boardIp, '192.168.1.100');
   assert.equal(Object.keys(JSON.parse(h.committed())).length, 3);
   assert.equal((await new h.DirectConnectionSettings().open({})).boardIp, saved.boardIp);
+  assert.equal((await settings.save('direct', 'LAN 192.168.1.101')).boardIp, '192.168.1.101');
+});
+
+test('saving the board address does not wait for an outstanding hardware probe', async () => {
+  const h=host(),index=readFileSync(path.join(root,'openharmony/entry/src/main/ets/pages/Index.ets'),'utf8');
+  const method=index.match(/  private async saveHardwareSource\([\s\S]*?\n  }/)[0];
+  const code=ts.transpileModule('class SaveHarness{'+method+'};SaveHarness;',{compilerOptions:{target:ts.ScriptTarget.ES2020}}).outputText;
+  const Harness=vm.runInContext(code,h.context),ui=new Harness(),settings=new h.DirectConnectionSettings();
+  await settings.open({});
+  let configured='';
+  Object.assign(ui,{directSettingsReady:true,hardwareTransportBusy:true,hardwareSourceDraft:'direct',boardIp:'LAN 192.168.1.101',directSettings:settings,directHardware:{configure:ip=>configured=ip},invalidateConnection(){},resetHardware(){},pollHardware(){}});
+  await ui.saveHardwareSource();
+  assert.equal(ui.savedBoardIp,'192.168.1.101');assert.equal(configured,ui.savedBoardIp);
+  assert.equal((await new h.DirectConnectionSettings().open({})).boardIp,ui.savedBoardIp);
 });
 
 test('failed preferences flush does not report a saved config or permit another pending write', async () => {
@@ -92,6 +106,17 @@ test('duplicate frames retain original expiry; a malformed response cannot resur
   assert.equal(view.read().deviceOnline, false); // repeated old frame cannot undo the failed read
   h.responseFrame(101); await view.poll(); assert.equal(view.read().deviceOnline, true);
   h.now(113000); assert.equal(view.read().deviceOnline, false);
+});
+
+test('foreground refresh and assistant can await the same in-flight direct sample', async () => {
+  const h = host(), view = new h.DirectHardwareView(); view.configure('10.0.0.2');
+  const response = deferred(); h.respond(response.promise);
+  const foreground = view.poll(), assistant = view.poll();
+  assert.equal(h.requests(),1);
+  response.resolve({responseCode:200,result:JSON.stringify(frame())});
+  const readings = await Promise.all([foreground,assistant]);
+  assert.ok(readings.every(reading=>reading.deviceOnline));
+  assert.ok(view.uploadSample().frameJson.includes('"uptime_ms":100'));
 });
 
 test('channel expiry masks readings while frame is online, and configuration cancels late context', async () => {
@@ -149,12 +174,14 @@ test('direct assistant refreshes actual board sample and awaits upload receipt b
  ui.selectPage(1);h.responseFrame(101);const pending=ui.requestHardwareAnalysis('温度建议');await new Promise(r=>setImmediate(r));
  assert.deepEqual(calls,['upload']);receipt.resolve('confirmed');await pending;
  assert.deepEqual(calls,['upload','analyze']);assert.match(ui.messages.at(-1).text,/test advice/);
- // A repeated frame after page invalidation cannot revive the old confirmed state.
- ui.selectPage(0);ui.selectPage(1);const before=calls.length;await ui.requestHardwareAnalysis('重复帧');assert.equal(calls.length,before);assert.match(ui.messages.at(-1).text,/没有已确认的新鲜直采帧/);
+ // A repeated frame after page invalidation falls back without using the old frame.
+ const scopedAnalyze=ui.cloudUpload.analyze;
+ ui.cloudUpload.analyze=async(_text,session,general)=>{if(!general)return scopedAnalyze(_text,session);assert.equal(session,'');calls.push('general');return {summary:'general advice',findings:[]};};
+ ui.selectPage(0);ui.selectPage(1);const before=calls.length;await ui.requestHardwareAnalysis('重复帧');assert.deepEqual(calls.slice(before),['general']);assert.match(ui.messages.at(-1).text,/通用农业建议/);
  // Explicitly block unimplemented native async-pipeline transport in direct mode.
  ui.pipelineBusy=false;ui.remoteMode=false;ui.pipelineInput='只读任务';ui.addEvent=()=>{};h.context.AgentPipelineView=h.load(path.join(services,'AgentPipelineView.ets')).AgentPipelineView;h.context.PipelineVerdictBadge=h.load(path.join(services,'AgentPipelineView.ets')).PipelineVerdictBadge;ui.cloudUpload.pipeline=async()=>{calls.push('cloud-pipeline');throw Error('device_task_failed');};await ui.requestAgentPipeline();assert.ok(calls.includes('cloud-pipeline'));assert.match(ui.pipelineError,/device_task_failed|三阶段/);
- // No model request after an upload failure.
- h.responseFrame(102);ui.cloudUpload.upload=async()=>{throw Error('upload_not_confirmed');};await ui.requestHardwareAnalysis('失败测试');assert.equal(calls.filter(c=>c==='analyze').length,1);assert.match(ui.messages.at(-1).text,/upload_not_confirmed/);
+ // A failed upload permits a general answer only.
+ h.responseFrame(102);ui.cloudUpload.upload=async()=>{throw Error('upload_not_confirmed');};await ui.requestHardwareAnalysis('失败测试');assert.equal(calls.filter(c=>c==='analyze').length,1);assert.equal(calls.at(-1),'general');assert.match(ui.cloudUploadStatus,/upload_not_confirmed/);
  // Navigating while waiting for upload must not send analysis using the former page context.
  h.responseFrame(103);const late=deferred();ui.cloudUpload.upload=()=>late.promise;
  const navigating=ui.requestHardwareAnalysis('切页测试');await new Promise(r=>setImmediate(r));ui.selectPage(2);late.resolve('confirmed');await navigating;

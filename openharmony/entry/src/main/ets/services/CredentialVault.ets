@@ -24,7 +24,8 @@ export class CredentialVault {
     return p;
   }
   private check(base: string, id: string, token: string): void {
-    if(normalizeGatewayAddress(base)!==base||!base.startsWith('https://')||!/^[A-Za-z0-9_.:-]{1,80}$/.test(id)||!/^[A-Za-z0-9_-]{32,256}$/.test(token))throw new Error('设备凭据格式无效');
+    // 协议限制集中在 normalizeGatewayAddress：http 仅回环/私有局域网，其余必须 HTTPS。
+    if(normalizeGatewayAddress(base)!==base||!/^[A-Za-z0-9_.:-]{1,80}$/.test(id)||!/^[A-Za-z0-9_-]{5,256}$/.test(token))throw new Error('设备凭据格式无效');
   }
   private async crypt(purpose: number, input: Uint8Array, nonce: Uint8Array, aad: Uint8Array, tag?: Uint8Array): Promise<Uint8Array> {
     const options: huks.HuksOptions = {properties:this.props(purpose,nonce,aad,tag),inData:input};

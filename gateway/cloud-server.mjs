@@ -1,12 +1,46 @@
+import {createHash,randomBytes,timingSafeEqual} from 'node:crypto';
+// 设备凭据保管：只存 SHA-256 摘要，明文令牌仅在校验命中时作为返回值的瞬时形态存在。
+// 目的：部署期由后台生成/轮换令牌，避免把明文长期留在配置文件里。
+// 长度下限 5：允许演示用短令牌（如 admin）。安全性来自 SHA-256 摘要比对，与令牌长度无关。
+const deviceTokenShape=value=>typeof value==='string'&&value.length>=5&&value.length<=256&&/^[A-Za-z0-9_-]+$/.test(value);
+const deviceTokenDigest=value=>createHash('sha256').update(value).digest('hex');
+const deviceDigestShape=value=>typeof value==='string'&&/^[a-f0-9]{64}$/.test(value);
+export class DeviceCredentials {
+  constructor(){this.entries=new Map();}
+  // 服务重启后可再次装载历史令牌：只保留摘要，不保留明文。
+  install(gatewayId,token){if(!deviceTokenShape(token))throw Error('invalid_device_credential');this.entries.set(gatewayId,deviceTokenDigest(token));}
+  // 台账恢复专用：入参已是 SHA-256 摘要，直接入册；再散列一次会让重启后的令牌校验永久失败。
+  installDigest(gatewayId,digest){if(!deviceDigestShape(digest))throw Error('invalid_device_credential_digest');this.entries.set(gatewayId,digest);}
+  issue(gatewayId){const token=randomBytes(32).toString('base64url');this.install(gatewayId,token);return {token,tokenSha256:deviceTokenDigest(token)};}
+  revoke(gatewayId){return this.entries.delete(gatewayId);}
+  verify(gatewayId,token){const expected=this.entries.get(gatewayId);
+    if(!expected||!deviceTokenShape(token))return false;
+    return timingSafeEqual(createHash('sha256').update(token).digest(),Buffer.from(expected,'hex'));}
+  sha256(gatewayId){return this.entries.get(gatewayId)??null;}
+  get size(){return this.entries.size;}
+}
+
+// 尚未发放令牌的设备占位：保留列表可见性，但不接受任何上报，也绝不伪造在线状态。
+export class DeviceAwaitingToken {
+  constructor({gatewayId,file}){Object.assign(this,{gatewayId,file,state:null});}
+  async open(){return this;}
+  authenticate(){throw Error('device_token_not_issued');}
+  async accept(){throw Error('device_token_not_issued');}
+  // 后台发放令牌时同步升级为接受上报：直接复用同一个文件与 gatewayId。
+  revoke(nextDigest){return new DayuIngress({gatewayId:this.gatewayId,tokenSha256:nextDigest,file:this.file}).open();}
+  current(){return {gatewayId:this.gatewayId,transport:'awaiting-token',hardware:{deviceOnline:false,reason:'device_token_not_issued',receivedAt:null,sampleAgeMs:null,quality:null}};}
+}
+
 import {replayHistory} from './history-replay.mjs';
 import {LocalSpeech} from './speech.mjs';
 import {CropReviews} from './crop-reviews.mjs';
 import {WeatherService} from './weather.mjs';
 import {weatherAdvice,weatherAdviceInput} from './weather-advice.mjs';
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
-import {readFile,mkdir,open,rm} from 'node:fs/promises';
-import {randomUUID,createHash} from 'node:crypto';
+import {readFile,writeFile,mkdir,open,rm} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 import {DayuIngress} from './dayu-ingest.mjs';
 import {CloudSecurity} from './cloud-security.mjs';
@@ -38,13 +72,33 @@ function queryHistory(history,kind,gatewayId,params){
  return {...data,schemaVersion:1,gatewayId,simulated:false,historical:true,isCurrent:false,items:data.items.map(row=>({seq:row.seq,hash:row.hash,recordedAt:row.recordedAt,sessionBootId:row.data.sessionBootId,historical:true,isCurrent:false,...(kind==='telemetry'?{observation:row.data.observation,replayed:row.data.replayed===true,capturedAt:row.data.capturedAt??null}:{prompt:row.data.prompt,analysis:row.data.analysis})}))};
 }
 
-export async function startCloudServer({dataDir,publicOrigin,users,devices,port=0,fetchFn=fetch,speechUrl='',staticDir=fileURLToPath(new URL('../admin-ui/dist/',import.meta.url))}){
+// 设备令牌摘要台账：只在数据目录保存 SHA-256，密钥材料本身从不落盘。
+const tokenLedgerRows=saved=>saved&&saved.schemaVersion===1&&saved.devices&&typeof saved.devices==='object'?{...saved.devices}:null;
+async function tokenLedger(file){
+ try{return tokenLedgerRows(JSON.parse(await readFile(file,'utf8')));}
+ catch(error){if(error.code==='ENOENT')return null;fail('device_token_ledger_unavailable');}
+}
+export async function startCloudServer({dataDir,publicOrigin,publicOriginHost='127.0.0.1',users,devices,deviceCredentials,port=0,fetchFn=fetch,speechUrl='',staticDir=fileURLToPath(new URL('../admin-ui/dist/',import.meta.url))}){
  const weather=new WeatherService({fetchFn});
+
+ // 部署期可用 deviceCredentials 生成/轮换设备令牌；配置里写死的摘要单独记下来，只用于展示“已配置”状态。
+ const digestOf=value=>deviceDigestShape(value)?value:null;
+ const configuredTokenDigests=new Map((devices||[]).filter(d=>d&&digestOf(d.tokenSha256)).map(d=>[d.gatewayId,digestOf(d.tokenSha256)]));
+ if(deviceCredentials!==undefined&&!(deviceCredentials instanceof DeviceCredentials))fail('invalid_device_credentials');
+ // 未显式传入时，从数据目录的摘要台账恢复已发放令牌（只含摘要）。
+ const credentials=deviceCredentials??new DeviceCredentials();
+ const savedLedger=deviceCredentials?null:await tokenLedger(path.join(dataDir,'device-tokens.json'));
+ if(savedLedger)for(const [gatewayId,digest] of Object.entries(savedLedger))if(digestOf(digest))credentials.installDigest(gatewayId,digest);
  if(!path.isAbsolute(dataDir)||!Array.isArray(devices)||devices.length<1||devices.length>100||!Number.isInteger(port)||port<0||port>65535)fail('invalid_cloud_config');
+ // 监听地址只接受回环或私有IPv4；公网入口仍必须由TLS反向代理承担。
+ if(typeof publicOriginHost!=='string'||net.isIP(publicOriginHost)!==4||!/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(publicOriginHost))fail('cloud_listen_host_must_be_private_ipv4');
  const sourceRoot=fileURLToPath(new URL('../',import.meta.url)),relativeData=path.relative(sourceRoot,dataDir);
  if(relativeData===''||(!path.isAbsolute(relativeData)&&!relativeData.startsWith('..'+path.sep)))fail('cloud_data_outside_project_required');
  const origin=new URL(publicOrigin);
- if(origin.origin!==publicOrigin||origin.username||origin.password||(origin.protocol!=='https:'&&!(origin.protocol==='http:'&&['localhost','127.0.0.1'].includes(origin.hostname))))fail('cloud_https_required');
+ // 明文HTTP只放行回环与私有局域网（演示/联调）；公网地址仍硬性要求HTTPS。
+ const privateV4=net.isIP(origin.hostname)===4&&(/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)/.test(origin.hostname));
+ const plainHttpAllowed=origin.protocol==='http:'&&(privateV4||origin.hostname==='localhost');
+ if(origin.origin!==publicOrigin||origin.username||origin.password||(origin.protocol!=='https:'&&!plainHttpAllowed))fail('cloud_https_required');
  const secure=origin.protocol==='https:',cookieName=secure?'__Host-pengan-session':'pengan-session';
  await mkdir(dataDir,{recursive:true});
  const lockFile=path.join(dataDir,'cloud-writer.lock');let writerLock;
@@ -69,7 +123,10 @@ export async function startCloudServer({dataDir,publicOrigin,users,devices,port=
  const ingresses=new Map(),planners=new Map();
  for(const device of devices){
   if(!id(device.gatewayId)||ingresses.has(device.gatewayId))fail('invalid_device_registration');
-  ingresses.set(device.gatewayId,await new DayuIngress({gatewayId:device.gatewayId,tokenSha256:device.tokenSha256,file:path.join(dataDir,'devices',device.gatewayId+'.json')}).open());
+   // 摘要来源：配置写死 > 后台已生成（deviceCredentials）；两者都没有时该设备只能等后台发令牌。
+  const file=path.join(dataDir,'devices',device.gatewayId+'.json');
+  const tokenSha256=digestOf(device.tokenSha256)||credentials.sha256(device.gatewayId)||null;
+  ingresses.set(device.gatewayId,tokenSha256?await new DayuIngress({gatewayId:device.gatewayId,tokenSha256,file}).open():await new DeviceAwaitingToken({gatewayId:device.gatewayId,file}).open());
  }
  const audit=async(event,actor='system',gatewayId='system',extra={})=>history.append({kind:'audit',gatewayId,data:{event,actor,...extra}});
  const selected=params=>{const key=params.get('gatewayId')||(ingresses.size===1?[...ingresses.keys()][0]:'');if(!ingresses.has(key))fail('gateway_required');return ingresses.get(key);};
@@ -92,17 +149,24 @@ export async function startCloudServer({dataDir,publicOrigin,users,devices,port=
    // list of prior device sessions or import another device's analyses.
    for(const existing of planners.keys())if(existing.startsWith(ingress.gatewayId+'/'))planners.delete(existing);
    const planner=new AgentPlanner({...config,fetchFn});
-   const prior=history.query({kind:'analysis',gatewayId:ingress.gatewayId,limit:200}).items.filter(r=>r.data.sessionBootId===session&&r.data.analysis.provider===config.provider&&r.data.analysis.model===config.model).slice(0,8).reverse();
+   const prior=history.query({kind:'analysis',gatewayId:ingress.gatewayId,limit:200}).items.filter(r=>r.data.analysis.generalOnly!==true&&r.data.sessionBootId===session&&r.data.analysis.provider===config.provider&&r.data.analysis.model===config.model).slice(0,8).reverse();
    planner.recentAnalyses=prior.map(r=>({request:r.data.prompt.slice(0,300),summary:r.data.analysis.summary.slice(0,500),observationReceivedAt:r.data.analysis.observationReceivedAt,executed:false}));
    planners.set(key,planner);
   }
   return planners.get(key);
  }
  async function analyze(ingress,body){
-  if(Object.keys(body).some(k=>k!=='prompt'))fail('invalid_prompt');
+  if(Object.keys(body).some(k=>k!=='prompt'&&k!=='generalOnly')||('generalOnly' in body&&body.generalOnly!==true))fail('invalid_prompt');
   if(modelBusy)fail('ai_busy_try_later');modelBusy=true;
   const session=ingress.state?.sessionBootId||'no-sample';
   try{
+   if(body.generalOnly===true){
+    const planner=new AgentPlanner({...config,fetchFn});
+    const analysis=await planner.analyze(body.prompt,hspSnapshot(null),{generalOnly:true});
+    const archived={...analysis,summary:'通用农业建议 · 未使用现场读数或历史\n'+analysis.summary.slice(0,1900)};
+    const row=await history.append({kind:'analysis',gatewayId:ingress.gatewayId,data:{prompt:body.prompt,analysis:archived,sessionBootId:'general-agriculture'}});
+    return {...analysis,gatewayId:ingress.gatewayId,persistence:{saved:true,recordId:row.seq}};
+   }
    const planner=plannerFor(ingress),analysis=await planner.analyze(body.prompt,ingress.current().hardware,{
     readEnvironment:()=>{if((ingress.state?.sessionBootId||'no-sample')!==session)fail('device_session_changed');return ingress.current().hardware;},
     readHistory:limit=>{const data=queryHistory(history,'telemetry',ingress.gatewayId,new URLSearchParams({limit:'200'}));return {...data,items:data.items.filter(r=>r.sessionBootId===session).slice(0,limit)};},
@@ -132,7 +196,7 @@ export async function startCloudServer({dataDir,publicOrigin,users,devices,port=
      const result=await pipelineTasks.start({gatewayId:ingress.gatewayId,prompt:body.prompt.trim(),actor,sessionBootId,onFinish:()=>{modelBusy=false;void reconcileAlerts(ingress.gatewayId,'system');},createPipeline:onEvent=>new AgentPipeline({...config,fetchFn,onEvent,
       readEnvironment:()=>{if((ingress.state?.sessionBootId||'no-sample')!==sessionBootId)fail('device_session_changed');return ingress.current().hardware;},
       readKnowledge:query=>knowledge.search(query,ingress.gatewayId,5),
-      readMemory:()=>history.query({kind:'analysis',gatewayId:ingress.gatewayId,limit:200}).items.filter(r=>r.data.sessionBootId===sessionBootId&&r.data.analysis.provider===config.provider&&r.data.analysis.model===config.model).slice(0,8).map(r=>r.seq),
+      readMemory:()=>history.query({kind:'analysis',gatewayId:ingress.gatewayId,limit:200}).items.filter(r=>r.data.analysis.generalOnly!==true&&r.data.sessionBootId===sessionBootId&&r.data.analysis.provider===config.provider&&r.data.analysis.model===config.model).slice(0,8).map(r=>r.seq),
      })});return result;
     }catch(error){modelBusy=false;throw error;}
  }
@@ -146,7 +210,15 @@ export async function startCloudServer({dataDir,publicOrigin,users,devices,port=
     const gatewayId=req.headers['x-pengan-gateway-id'],ingress=ingresses.get(gatewayId);
     if(!ingress)fail('device_unauthorized');
     const auth=req.headers.authorization,token=typeof auth==='string'&&auth.startsWith('Bearer ')?auth.slice(7):'';
-    ingress.authenticate(token);
+    // 未入册设备没有摘要可比，authenticate 只有 DayuIngress 才有。
+    if(ingress.authenticate)ingress.authenticate(token);
+    if(req.method==='POST'&&route==='/api/v1/device/diagnostics'){
+     if(!req.headers['content-type']?.startsWith('application/json'))fail('json_required');
+     const report=await json(req,256);
+     if(!report||Object.keys(report).length!==1||report.event!=='native_session_verified')fail('invalid_native_diagnostic');
+     console.info('[DAYU200] '+new Date().toISOString()+' native_session_verified');
+     send(202,{accepted:true});return;
+    }
     if(req.method==='GET'&&route==='/api/v1/device/weather'){send(200,{...await weather.read(),gatewayId:ingress.gatewayId});return;}
     if(req.method==='POST'&&route==='/api/v1/device/weather/advice'){if(!req.headers['content-type']?.startsWith('application/json'))fail('json_required');send(200,await generateWeatherAdvice(ingress.gatewayId,await json(req),'device'));return;}
     if(req.method==='POST'&&route==='/api/v1/telemetry/replay'){
@@ -320,7 +392,24 @@ export async function startCloudServer({dataDir,publicOrigin,users,devices,port=
    }
    if(route==='/api/agent/pipeline'&&req.method==='POST'){send(202,await launchPipeline(selected(url.searchParams),await json(req),actor));return;}
    if(route==='/api/health'&&req.method==='GET'){send(200,{ok:true,mode:'hardware',simulated:false,transport:'dayu-direct',hardwareConnected:[...ingresses.values()].some(i=>i.current().hardware.deviceOnline)});return;}
-   if(route==='/admin-api/devices'&&req.method==='GET'){send(200,{items:[...ingresses.values()].map(i=>i.current())});return;}
+   // 设备令牌由后台生成/轮换：明文只在本次响应中出现一次，服务端只留摘要。
+   if(route==='/admin-api/devices'&&req.method==='GET'){send(200,{items:[...ingresses.values()].map(i=>({...i.current(),tokenConfigured:Boolean(digestOf(configuredTokenDigests.get(i.gatewayId))||credentials.sha256(i.gatewayId))}))});return;}
+   if(route==='/admin-api/devices/token'&&req.method==='POST'){
+    const body=await json(req),gatewayId=body.gatewayId;
+    if(typeof gatewayId!=='string'||!ingresses.has(gatewayId)||Object.keys(body).some(k=>!['gatewayId','force'].includes(k))||(body.force!==undefined&&typeof body.force!=='boolean'))fail('invalid_device_token_request');
+    if(digestOf(configuredTokenDigests.get(gatewayId))&&!body.force)fail('device_token_configured');
+    if(credentials.sha256(gatewayId)&&!body.force)fail('device_token_exists');
+    const issued=credentials.issue(gatewayId);
+    // revoke(digest) 统一承担「换新摘要」：已入册设备原地替换，未入册设备升级为 DayuIngress。
+    const previous=ingresses.get(gatewayId),rotated=previous instanceof DayuIngress;
+    ingresses.set(gatewayId,await previous.revoke(issued.tokenSha256));
+    // 摘要落盘（0o600）供重启后继续鉴权；明文令牌只存在于本次响应。
+    const ledger=path.join(dataDir,'device-tokens.json'),ledgerRows=(await tokenLedger(ledger))||{};
+    ledgerRows[gatewayId]=issued.tokenSha256;
+    await writeFile(ledger,JSON.stringify({schemaVersion:1,devices:ledgerRows}),{mode:0o600});
+    await audit(rotated?'device_token_rotated':'device_token_issued',actor,gatewayId);
+    send(200,{gatewayId,token:issued.token,tokenSha256:issued.tokenSha256,scheme:'Bearer',header:'x-pengan-gateway-id',persisted:false,warning:'令牌仅在本次响应中出现，请立即录入DAYU200；服务端只保存SHA-256摘要。'});return;
+   }
    if(route==='/admin-api/audit'&&req.method==='GET'){security.requireRole(session,'admin');const limit=Number(url.searchParams.get('limit')||50);send(200,history.query({kind:'audit',limit,beforeSeq:url.searchParams.has('beforeSeq')?Number(url.searchParams.get('beforeSeq')):undefined}));return;}
    if(route==='/api/observations'&&req.method==='GET'){send(200,selected(url.searchParams).current());return;}
    if(route==='/api/hardware/history'&&req.method==='GET'){send(200,queryHistory(history,'telemetry',selected(url.searchParams).gatewayId,url.searchParams));return;}
@@ -348,10 +437,10 @@ export async function startCloudServer({dataDir,publicOrigin,users,devices,port=
   }
  });
  server.requestTimeout=35000;server.headersTimeout=5000;server.maxHeadersCount=32;
- await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,'127.0.0.1',()=>{server.off('error',reject);resolve();});});
- if(!secure&&origin.port==='0')publicOrigin='http://127.0.0.1:'+server.address().port;
+ await new Promise((resolve,reject)=>{server.once('error',reject);server.listen(port,publicOriginHost,()=>{server.off('error',reject);resolve();});});
+ if(!secure&&origin.port==='0')publicOrigin='http://'+origin.hostname+':'+server.address().port;
  let closing;
  const close=()=>closing??=(async()=>{try{await new Promise(resolve=>server.close(resolve));await pipelineTasks.close();await knowledge.flush();await history.flush();}finally{await database?.close();await writerLock.close();await rm(lockFile,{force:true});}})();
- return {server,port:server.address().port,publicOrigin,close,security,history,ingresses,knowledge,pipelineTasks,humanReview,alertCenter:alerts,database};
+ return {server,port:server.address().port,publicOrigin,close,security,history,ingresses,knowledge,pipelineTasks,humanReview,alertCenter:alerts,database,deviceCredentials:credentials};
  }catch(error){await database?.close();await writerLock.close();await rm(lockFile,{force:true});throw error;}
 }

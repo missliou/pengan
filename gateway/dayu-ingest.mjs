@@ -24,7 +24,8 @@ export class DayuIngress {
     Object.assign(this, {gatewayId, tokenSha256, file, now}); this.state = null; this.busy = false; this.ready = false;
   }
   authenticate(token) {
-    if (typeof token !== 'string' || token.length < 32 || token.length > 256 || !/^[A-Za-z0-9_-]+$/.test(token)) fail('device_unauthorized');
+    // 长度下限 5：允许演示用短令牌（如 admin）。字符集与摘要比对不变，安全性不依赖长度。
+    if (typeof token !== 'string' || token.length < 5 || token.length > 256 || !/^[A-Za-z0-9_-]+$/.test(token)) fail('device_unauthorized');
     if (!timingSafeEqual(createHash('sha256').update(token).digest(), Buffer.from(this.tokenSha256, 'hex'))) fail('device_unauthorized');
   }
   async open() {
@@ -71,10 +72,11 @@ export class DayuIngress {
   }
 }
 
-// Fixed loopback listener behind a TLS reverse proxy. No public-bind option and
-// no unauthenticated current-data/admin endpoint.
-export async function startDayuIngressServer(ingress, {port = 0} = {}) {
+// Loopback by default behind a TLS reverse proxy; host may widen only to a private
+// IPv4 for on-site demos. No public-bind option and no unauthenticated endpoint.
+export async function startDayuIngressServer(ingress, {port = 0, host = '127.0.0.1'} = {}) {
   if (!Number.isInteger(port) || port < 0 || port > 65535 || !ingress.ready) fail('invalid_ingress_listener');
+  if (host !== '127.0.0.1' && !(/^(10|127|192\.168|172\.(1[6-9]|2[0-9]|3[01]))\./.test(host) && /^\d{1,3}(\.\d{1,3}){3}$/.test(host))) fail('ingress_host_must_be_private_ipv4');
   const server = http.createServer(async (req, res) => {
     const send = (status, body) => { res.writeHead(status, {'content-type':'application/json; charset=utf-8','cache-control':'no-store'}); res.end(JSON.stringify(body)); };
     try {
@@ -100,6 +102,6 @@ export async function startDayuIngressServer(ingress, {port = 0} = {}) {
     }
   });
   server.requestTimeout = 5000; server.headersTimeout = 5000; server.maxHeadersCount = 32;
-  await new Promise((resolve,reject) => { server.once('error',reject); server.listen(port,'127.0.0.1',() => {server.off('error',reject);resolve();}); });
+  await new Promise((resolve,reject) => { server.once('error',reject); server.listen(port,host,() => {server.off('error',reject);resolve();}); });
   return server;
 }

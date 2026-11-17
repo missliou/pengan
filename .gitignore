@@ -9,6 +9,7 @@ node_modules/
 *.cer
 .env
 **/cloud-config.json
+**/cloud-config.demo-lan.json
 **/device-credential.json
 **/model-config.json
 **/cloud-writer.lock

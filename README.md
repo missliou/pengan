@@ -69,6 +69,6 @@ python start_cloud.py --config /etc/pengan/cloud-config.json
 
 ## 比赛交付
 
-[下载比赛 ZIP](https://github.com/missliou/pengan/releases/tag/v0.1.0)。包内包含源码、部署说明、运行截图、HH-HSP101 0.1.4 候选固件、未签名 HAP 及 SHA256 校验清单。HAP 安装前须按目标设备签名。[原生构建说明](docs/OpenHarmony7迁移记录.md)
+[下载 v0.1.1 代码与 Demo](https://github.com/missliou/pengan/releases/tag/v0.1.1)。包内包含源码、Ubuntu 部署说明、Web 构建、运行截图、HH-HSP101 0.1.8 通用候选固件、未签名 API 26 HAP 和 SHA256 校验清单。HAP 安装前须按目标设备签名。[原生构建说明](docs/OpenHarmony7迁移记录.md)
 
-已有 SDK 构建、主机测试和板端开机常亮验证。新版三端实物联调与天气 AI 真实模型验收仍待完成。[验证记录](docs/原生功能中心与天气AI-20261105.md)
+本版修复 HH-HSP101 读取时触发的栈溢出和 DAYU200 局域网联调上报问题，并允许保存采集板新地址。农业助手在缺少现场数据时仍可回复通用种植问题。已完成交叉编译、电脑端上报回归和 DeepSeek 通用问答测试，新版三端实物联调待验。[历史验证记录](docs/原生功能中心与天气AI-20261105.md)

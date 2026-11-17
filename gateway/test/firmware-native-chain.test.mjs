@@ -16,7 +16,7 @@ const root=fileURLToPath(new URL('../../',import.meta.url)),sha=s=>createHash('s
 test('current C firmware formatter -> real board HTTP -> actual native parser/uploader -> authenticated Web history',async t=>{
  const fixture=JSON.parse(readFileSync(new URL('./fixtures/firmware-http-frame.json',import.meta.url),'utf8').replace(/^\uFEFF/,''));
  const c=readFileSync(path.join(root,'firmware/hh-hsp101/src/dashboard.c'),'utf8');
- const producer=c.slice(c.indexOf('size_t dash_pengan_json'),c.indexOf('static void pengan_telemetry')).trim().replace(/\r\n/g,'\n');
+ const producer=c.slice(c.indexOf('static char telemetry_json[512]'),c.indexOf('static void pengan_telemetry')).trim().replace(/\r\n/g,'\n');
  assert.equal(sha(producer),fixture.producerSha256,'Regenerate fixture with actual C formatter after firmware changes');assert.equal(fixture.synthetic,true);
  const board=createServer((req,res)=>{assert.equal(req.url,'/api/pengan/telemetry');res.setHeader('content-type','application/json');res.end(JSON.stringify(fixture.frame));});
  await new Promise(resolve=>board.listen(0,'127.0.0.1',resolve));t.after(()=>new Promise(resolve=>board.close(resolve)));

@@ -12,7 +12,8 @@ class PipelineReceipt { taskId: string = ''; gatewayId: string = ''; }
 class WeatherQuestion { question: string = ''; }
 class PipelineTask extends PipelineReceipt { status: string = ''; error: string = ''; result: AgentPipelineResult = new AgentPipelineResult(); }
 class Receipt { schemaVersion: number = 0; accepted: boolean = false; duplicate: boolean = false; }
-class ScopedAnalysis extends HardwareAnalysis { gatewayId: string = ''; sessionBootId: string = ''; }
+class ScopedAnalysis extends HardwareAnalysis { gatewayId: string = ''; sessionBootId: string = ''; generalOnly: boolean = false; }
+class GeneralQuestion { prompt: string = ''; generalOnly: boolean = true; }
 class ScopedImageAnalysis extends CropImageAnalysis { gatewayId: string = ''; }
 class ImageBody { prompt: string = '请描述照片中可见作物现象、养护建议及不能确定的内容，不作病害确诊，不执行设备。'; mimeType: string = 'image/jpeg'; imageBase64: string = ''; }
 class MediaBody { category: string = ''; label: string = ''; capturedAt: number = 0; base64: string = ''; authorized: boolean = false; uploadId: string = ''; }
@@ -27,6 +28,7 @@ class FrameTime { uptime_ms: number = -1; }
 class SpeechBody { wavBase64: string = ''; authorized: boolean = false; }
 class SpeechStatus { gatewayId: string = ''; configured: boolean = false; engine: string = ''; externalProvider: boolean = true; }
 class SpeechReceipt { gatewayId: string = ''; text: string = ''; engine: string = ''; requiresConfirmation: boolean = false; executed: boolean = true; }
+class ConsoleEvent { event: string = ''; }
 
 // Plaintext token stays in memory. Optional CredentialVault persists HUKS ciphertext only.
 export class CloudUpload {
@@ -37,6 +39,17 @@ export class CloudUpload {
   private busy: boolean = false;
   private pipelineRunning: boolean = false;
   configured(): boolean { return this.token.length > 0; }
+
+  async verifySession(): Promise<void> {
+    await this.request('/api/v1/device/observations', '', 5000, true);
+  }
+
+  async reportConsole(event: string): Promise<void> {
+    const report: ConsoleEvent = { event: event };
+    await this.request('/api/v1/device/diagnostics', JSON.stringify(report), 5000, false, 202);
+  }
+  // 演示用明文HTTP只允许局域网/回环目标（协议在本机校验，见 ConnectionSettings.normalizeGatewayAddress）。
+  demoTlsBypass(): boolean { return this.base.startsWith('http://'); }
   async readCropReviews(): Promise<NativeCropInbox> {
     return parseCropInbox(await this.request('/api/v1/device/crop-reviews','',5000,true),this.id);
   }
@@ -59,9 +72,10 @@ export class CloudUpload {
     return receipt.text.trim();
   }
   configure(base: string, id: string, token: string): void {
+    // normalizeGatewayAddress 已把 http 限定在回环/私有局域网，HTTPS 仍是默认要求。
     const checked = normalizeGatewayAddress(base);
-    if (!checked.startsWith('https://')) throw new Error('设备令牌只允许发送到HTTPS云端');
-    if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(id) || !/^[A-Za-z0-9_-]{32,256}$/.test(token)) throw new Error('云端登记ID或设备令牌格式无效');
+    // 令牌下限 5：允许演示用短令牌。字符集不变，安全性来自服务端摘要比对。
+    if (!/^[A-Za-z0-9_.:-]{1,80}$/.test(id) || !/^[A-Za-z0-9_-]{5,256}$/.test(token)) throw new Error('云端登记ID或设备令牌格式无效');
     this.base = checked; this.id = id; this.token = token; this.revision++;
   }
   invalidate(): void { this.revision++; }
@@ -102,7 +116,8 @@ export class CloudUpload {
       });
       if (revision !== this.revision) throw new Error('云端上下文已变化，旧结果作废');
       if (Date.now() < started || Date.now() - started >= timeout) throw new Error('云端请求超时，结果未确认');
-      if (response.responseCode !== expectedStatus || typeof response.result !== 'string') throw new Error('云端请求未确认，请检查认证或服务状态');
+      if (response.responseCode === 401) throw new Error('设备凭据未通过（401），请核对登记的设备 ID 和设备令牌');
+      if (response.responseCode !== expectedStatus || typeof response.result !== 'string') throw new Error('云端请求未确认（HTTP ' + response.responseCode.toString() + '）');
       if (new util.TextEncoder().encodeInto(response.result).byteLength > responseLimit) throw new Error('云端响应超过限制');
       return response.result;
     } finally { try { if (client) client.destroy(); } finally { this.busy = false; } }
@@ -159,12 +174,14 @@ export class CloudUpload {
     if (!receipt || receipt.schemaVersion !== 1 || typeof receipt.accepted !== 'boolean' || typeof receipt.duplicate !== 'boolean' || receipt.accepted === receipt.duplicate) throw new Error('上报回执无效，结果未确认');
     return receipt.accepted ? '云端已确认接收本次帧' : '云端确认重复帧，未更新原失效时间';
   }
-  async analyze(prompt: string, expectedSession: string = ''): Promise<HardwareAnalysis> {
+  async analyze(prompt: string, expectedSession: string = '', generalOnly: boolean = false): Promise<HardwareAnalysis> {
     if (prompt.trim().length === 0 || prompt.length > 1000) throw new Error('请输入1至1000字问题');
     const body: PromptBody = { prompt: prompt.trim() };
-    const result = JSON.parse(await this.request('/api/v1/device/analyze', JSON.stringify(body), 35000)) as ScopedAnalysis;
+    const general: GeneralQuestion = { prompt: body.prompt, generalOnly: true };
+    const result = JSON.parse(await this.request('/api/v1/device/analyze', JSON.stringify(generalOnly ? general : body), 35000)) as ScopedAnalysis;
     if (!result || result.gatewayId !== this.id || result.mode !== 'hardware' || result.simulated !== false || result.executed !== false || result.hardwareControl !== false || result.realAdmission !== 'unknown_denied' || typeof result.summary !== 'string' || result.summary.length > 2000 || !Array.isArray(result.findings) || !Array.isArray(result.unknowns) || !result.findings.every((v: string) => typeof v === 'string') || !result.unknowns.every((v: string) => typeof v === 'string') || (result.provider !== 'deepseek' && result.provider !== 'qwen') || typeof result.model !== 'string' || typeof result.deviceOnline !== 'boolean') throw new Error('设备隔离分析协议无效');
     if (result.findings.length > 10 || result.unknowns.length > 12 || !result.findings.concat(result.unknowns).every((v: string) => v.length <= 1000)) throw new Error('分析条目超过限制');
+    if (generalOnly && (result.generalOnly !== true || result.deviceOnline || result.observationReceivedAt !== null)) throw new Error('通用问答回执与请求不一致');
     if (result.deviceOnline && (expectedSession.length === 0 || result.sessionBootId !== expectedSession)) throw new Error('云端观测会话与本地直采不符，未显示分析');
     return result;
   }

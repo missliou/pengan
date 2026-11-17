@@ -11,6 +11,5 @@ void dash_web_start(void);
 
 size_t dash_pengan_json(char *frame,size_t capacity);
 
-const char *dash_wifi_state(void);
-void dash_wifi_address(char *out,size_t capacity);
+void dash_wifi_display(char *out,size_t capacity);
 bool dash_receive_weather(const char *body);

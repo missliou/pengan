@@ -8,7 +8,11 @@ if(args.length!==2||args[0]!=='--config'||!path.isAbsolute(args[1]||'')){
  try{
   const config=JSON.parse(await readFile(args[1],'utf8'));
   const runtime=await startCloudServer(config);
-  console.log('棚安云端服务已监听本机回环端口 '+runtime.port+'；公网访问需配置HTTPS反向代理。');
+  const host=config.publicOriginHost||'127.0.0.1';
+  console.log('棚安云端服务已监听 '+host+':'+runtime.port+'（原站 '+runtime.publicOrigin+'）。');
+  console.log('Web 管理台：'+runtime.publicOrigin+'/');
+  console.log('DAYU200 上报入口：POST '+runtime.publicOrigin+'/api/v1/telemetry/current（Bearer 设备令牌）。');
+  console.log(host==='127.0.0.1'?'公网访问需配置HTTPS反向代理。':'已对私有局域网开放明文HTTP，仅用于演示/联调；令牌与数据未加密，禁止用于公网。');
   let closing=false;
   const close=async()=>{if(closing)return;closing=true;await runtime.close();process.exit(0);};
   process.once('SIGINT',close);process.once('SIGTERM',close);

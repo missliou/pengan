@@ -10,7 +10,7 @@ export class DirectConnectionConfig {
 export function normalizeDirectConfig(mode: string, boardIp: string): DirectConnectionConfig {
   if (mode !== 'direct' && mode !== 'gateway') throw new Error('采集模式无效');
   if (typeof boardIp !== 'string') throw new Error('采集板IP无效');
-  const ip = boardIp.trim();
+  const ip = boardIp.trim().replace(/^LAN\s+/i, '');
   if (ip.length > 0) {
     const parts: string[] = ip.split('.');
     if (parts.length !== 4 || !parts.every((part: string) => /^\d+$/.test(part) && Number(part) <= 255 && Number(part).toString() === part)) throw new Error('请填写裸私网IPv4，不含http、端口或路径');

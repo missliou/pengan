@@ -149,6 +149,10 @@ export const adminSession = async () => rememberSession(await request('/session'
 
 // [待实现] 设备管理（列表 / 关联 / 配对令牌 / 诊断）
 export const listDevices = (options = {}) => request('/devices',{...options,base:ADMIN()});
+
+// POST /admin-api/devices/token  仅 admin。令牌明文只出现这一次，服务端只保存 SHA-256 摘要。
+export const issueDeviceToken = (body = {}, options = {}) =>
+  request('/devices/token', {...options, base:ADMIN(), method:'POST', body, timeoutMs:15000});
 export const getDeviceDetail = () => notImplemented('设备详情', 'GET', '/devices/{id}', ADMIN());
 
 // [待实现] 服务端分页 / 条件筛选 / 服务端导出

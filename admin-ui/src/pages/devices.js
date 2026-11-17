@@ -13,7 +13,7 @@ import { fmtDateTime, fmtRelative, fmtAge, fmtValue, fmtSource, sourceKind, fmtR
 import { watchHardware } from '../lib/live-hardware.js';
 
 import { LiveObservations, validateObservations } from '../lib/freshness.js';
-import { ApiError } from '../lib/api.js';
+import { ApiError, issueDeviceToken } from '../lib/api.js';
 
 const LIST_REFRESH_MS = 5000;
 
@@ -48,6 +48,7 @@ export default async function renderDevices(ctx) {
     + (LIST_REFRESH_MS / 1000) + ' 秒刷新；点击一行可切换为当前设备。',
     listHost));
 
+
   // ---------- 设备列表（真实接口，失败不虚构） ----------
   let busy = false, lastListAt = 0, lastItems = null, staleSignature = '';
   let deviceLives = new Map();
@@ -62,6 +63,50 @@ export default async function renderDevices(ctx) {
     return JSON.stringify(items);
   }
 
+  // ---------- 设备令牌（后台生成，明文只显示一次） ----------
+  const tokenHost = el('div', { class: 'token-panel' });
+  const selectedDevice = () => (Array.isArray(lastItems) && lastItems.length
+    ? (lastItems.find(i => i.gatewayId === ctx.state?.gatewayId) || lastItems[0]).gatewayId
+    : '');
+  wrap.append(sectionCard('设备令牌（后台生成，DAYU200 用它上报）',
+    '场景：DAYU200 首次接入或令牌遗失时，由管理员在这里生成一次性令牌并录入设备。令牌明文只在生成的那一刻显示，服务端只保存 SHA-256 摘要；重新生成会立即让旧令牌失效。',
+    tokenHost));
+
+  function paintTokenPanel(issued = null) {
+    if (!ctx.scope.active) return;
+    const gatewayId = selectedDevice();
+    const node = el('div', {});
+    if (!gatewayId) {
+      node.append(banner('warn', '尚未登记设备：请先在部署配置中登记 gatewayId，之后才能发放令牌。'));
+      tokenHost.replaceChildren(node);
+      return;
+    }
+    const item = (lastItems || []).find(i => i.gatewayId === gatewayId) || {};
+    const configured = item.tokenConfigured === true;
+    node.append(el('p', { text: '目标设备：' + gatewayId + '（' + (configured ? '已有令牌摘要' : '尚未发放令牌，设备暂时无法上报') + '）' }));
+    const status = el('p', { class: 'hint' });
+    const action = button(issued ? '重新生成并作废旧令牌' : '生成设备令牌', async () => {
+      status.textContent = '正在生成…';
+      try {
+        const result = await issueDeviceToken({ gatewayId, force: Boolean(issued || configured) });
+        paintTokenPanel(result);
+        status.textContent = '已生成。请立即把令牌录入 DAYU200：服务端只保存摘要，关闭后无法再次查看。';
+      } catch (error) {
+        status.textContent = '生成失败：' + (error?.code || error?.message || error);
+      }
+    });
+    if (issued?.token) {
+      const box = el('pre', { class: 'token-value', text: issued.token });
+      const hints = el('ul', { class: 'hint' });
+      hints.append(el('li', { text: '请求头：Authorization: Bearer <上面的令牌>' }));
+      hints.append(el('li', { text: '同时必须带 x-pengan-gateway-id: ' + issued.gatewayId }));
+      hints.append(el('li', { text: '以及 x-pengan-sent-at: 设备当前毫秒时间戳（与服务端时钟误差需在 3 秒内）' }));
+      hints.append(el('li', { text: '上报地址：POST ' + location.origin + '/api/v1/telemetry/current' }));
+      node.append(banner('warn', '令牌只显示这一次，关闭页面后无法再次获取；遗失请重新生成。'), box, hints);
+    }
+    node.append(action, status);
+    tokenHost.replaceChildren(node);
+  }
   function paintList(items) {
     if (!ctx.scope.active) return;
     if (!Array.isArray(items) || items.length === 0) {
@@ -139,9 +184,11 @@ export default async function renderDevices(ctx) {
       deviceLives = nextLives;
       lastItems = response.items;
       paintList(currentItems());
+      paintTokenPanel();
     } catch (error) {
       if (!ctx.scope.active) return;
       lastItems = null;
+      paintTokenPanel();
       for (const live of deviceLives.values()) live.invalidate();
       listHost.replaceChildren(failureBanner(error, '设备登记列表'));
     } finally { busy = false; }
@@ -160,6 +207,7 @@ export default async function renderDevices(ctx) {
     listHost.replaceChildren(banner('warn',
       '演示模式不读取真实设备登记，也不显示虚构设备数量。退出演示模式并登录管理会话后可查看已登记 DAYU200。'));
   } else {
+    paintTokenPanel();
     await refreshList();
     if (!ctx.scope.active) return wrap;
     lastListAt = Date.now();

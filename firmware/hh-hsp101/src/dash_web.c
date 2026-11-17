@@ -16,6 +16,7 @@ static char g_wifi_mode[8] = "AP";
 static char g_wifi_ssid[33] = DASH_WIFI_AP_SSID;
 static char g_wifi_ip[20] = "192.168.43.1";
 static char g_net_ifname[WIFI_IFNAME_MAX_SIZE + 1] = {0};
+static bool g_ap_ready;
 
 static void update_ip_str(void) {
     if (!g_net_ifname[0]) return;
@@ -53,6 +54,7 @@ static bool wifi_setup_softap(void) {
     struct netif *netif_p = netif_find(g_net_ifname);
     if (!netif_p) {
         printf("[web] netif_find(%s) failed\r\n", g_net_ifname);
+        hi_wifi_softap_stop();
         return false;
     }
     ip4_addr_t ipaddr, netmask, gw;
@@ -61,7 +63,9 @@ static bool wifi_setup_softap(void) {
     IP4_ADDR(&gw, 192, 168, 43, 1);
     if (netifapi_netif_set_addr(netif_p, &ipaddr, &netmask, &gw) != 0 ||
         netifapi_dhcps_start(netif_p, NULL, 0) != 0) {
-        printf("[web] AP address or DHCP failed\r\n");return false;
+        printf("[web] AP address or DHCP failed\r\n");
+        hi_wifi_softap_stop();
+        return false;
     }
 
     snprintf(g_wifi_mode, sizeof(g_wifi_mode), "AP");
@@ -84,6 +88,7 @@ static bool sta_start(void){
 }
 static bool wifi_setup_sta(void){
  g_connection="connecting";
+ snprintf(g_wifi_ip,sizeof(g_wifi_ip),"%s",g_ap_ready?"192.168.43.1":"0.0.0.0");
  if(!sta_start()){g_connection="sta_start_failed";return false;}
  hi_wifi_sta_disconnect();
  struct netif *n=netif_find(g_sta_if);
@@ -109,13 +114,23 @@ static bool wifi_setup_sta(void){
   hi_sleep(200);
  }
  hi_wifi_sta_disconnect();if(n)netifapi_dhcp_stop(n);
- g_connection="connection_or_dhcp_failed";snprintf(g_wifi_mode,sizeof(g_wifi_mode),"AP");snprintf(g_wifi_ip,sizeof(g_wifi_ip),"192.168.43.1");
+ g_connection="connection_or_dhcp_failed";snprintf(g_wifi_mode,sizeof(g_wifi_mode),"AP");
  return false;
+}
+
+/* One accepted client at a time. Keep large buffers off the LiteOS task stack. */
+static char http_request[3072];
+static char http_body[4096];
+static uint32_t http_deadline;
+
+static int client_recv(int fd, char *buf, size_t len) {
+    if (dash_due(hi_get_milli_seconds(), http_deadline)) return -1;
+    return lwip_recv(fd, buf, len, 0);
 }
 
 static void send_all(int fd, const char *buf, size_t len) {
     size_t sent = 0;
-    while (sent < len) {
+    while (sent < len && !dash_due(hi_get_milli_seconds(), http_deadline)) {
         size_t chunk = len - sent;
         if (chunk > 1024u) chunk = 1024u;
         int w = lwip_send(fd, buf + sent, chunk, 0);
@@ -131,7 +146,23 @@ static bool lan_address_ready(void){
 }
 #include "dash_provision.h"
 static volatile bool connection_worker;
-static hi_void *connect_task(hi_void *arg){(void)arg;if(wifi_setup_sta())provision_save();memset(g_target_key,0,sizeof(g_target_key));pending_connect=false;connection_worker=false;return HI_NULL;}
+static bool save_requested;
+static void load_network_target(void){
+ if(DASH_WIFI_STA_SSID[0]){
+  snprintf(g_target_ssid,sizeof(g_target_ssid),"%s",DASH_WIFI_STA_SSID);
+  snprintf(g_target_key,sizeof(g_target_key),"%s",DASH_WIFI_STA_KEY);
+ }else{
+  provision_load();
+ }
+}
+static hi_void *connect_task(hi_void *arg){
+ (void)arg;
+ if(wifi_setup_sta()&&save_requested)provision_save();
+ memset(g_target_key,0,sizeof(g_target_key));
+ connection_worker=false;
+ pending_connect=false;
+ return HI_NULL;
+}
 static void begin_connect(void){
  if(connection_worker||!pending_connect)return;
  connection_worker=true;hi_u32 id=0;hi_task_attr attr={0};attr.task_name="WifiConnect";attr.stack_size=4096;attr.task_prio=27;
@@ -140,18 +171,28 @@ static void begin_connect(void){
 
 
 static void handle_http_client(int client_fd) {
-    char req[3072];
-    static char json_buf[4096];
     char hdr[256];
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 350000 };
+    if (lwip_setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0 ||
+        lwip_setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) return;
+    http_deadline = hi_get_milli_seconds() + 1500;
 
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-    lwip_setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    int r = lwip_recv(client_fd, req, sizeof(req) - 1, 0);
+    char *req = http_request;
+    int r = client_recv(client_fd, req, sizeof(http_request) - 1);
     if (r <= 0) return;
     req[r] = '\0';
-    while(!strstr(req,"\r\n\r\n") && (size_t)r<sizeof(req)-1){int more=lwip_recv(client_fd,req+r,sizeof(req)-1-r,0);if(more<=0)return;r+=more;req[r]=0;}
-    if(provision_route(client_fd,req,(size_t)r))return;
+    while (!strstr(req,"\r\n\r\n")) {
+        size_t remaining = sizeof(http_request) - 1 - (size_t)r;
+        if (!remaining) return;
+        int more = client_recv(client_fd, req+r, remaining);
+        if (more <= 0) return;
+        r += more;
+        req[r] = '\0';
+    }
+    if (strncmp(req, "GET /api/wifi/scan ", sizeof("GET /api/wifi/scan ") - 1) == 0) {
+        http_deadline = hi_get_milli_seconds() + 4500; /* the SDK scan needs about 3.5 s */
+    }
+    if(provision_route(client_fd,req,(size_t)r,http_body,sizeof(http_body)))return;
 
     int route = dash_http_route(req, (size_t)r);
     if (route == DASH_ROUTE_OPTIONS) {
@@ -191,7 +232,7 @@ static void handle_http_client(int client_fd) {
         st.wifi_mode = g_wifi_mode;
         st.wifi_ssid = g_wifi_ssid;
         st.wifi_ip = g_wifi_ip;
-        size_t jlen = dash_status_json(json_buf, sizeof(json_buf), &st);
+        size_t jlen = dash_status_json(http_body, sizeof(http_body), &st);
         int hlen = snprintf(
             hdr, sizeof(hdr),
             "HTTP/1.1 200 OK\r\n"
@@ -203,7 +244,7 @@ static void handle_http_client(int client_fd) {
             (unsigned)jlen
         );
         if (hlen > 0) send_all(client_fd, hdr, (size_t)hlen);
-        if (jlen > 0) send_all(client_fd, json_buf, jlen);
+        if (jlen > 0) send_all(client_fd, http_body, jlen);
         return;
     }
 
@@ -218,9 +259,11 @@ static void handle_http_client(int client_fd) {
 static hi_void *web_server_task(hi_void *arg) {
     (void)arg;
     hi_sleep(300);
-    if(!wifi_setup_softap()){printf("[web] provisioning AP failed\r\n");return HI_NULL;}
-    sta_start();
-    provision_load();
+    if(!DASH_WIFI_STA_SSID[0]){
+        g_ap_ready=wifi_setup_softap();
+        if(!g_ap_ready)printf("[web] provisioning AP failed; continuing in STA mode\r\n");
+    }
+    load_network_target();
     if(g_target_ssid[0]){pending_connect=true;begin_connect();}
 
     int srv_fd = lwip_socket(AF_INET, SOCK_STREAM, 0);
@@ -249,7 +292,30 @@ static hi_void *web_server_task(hi_void *arg) {
     }
     printf("[web] HTTP server listening on port %d\r\n", DASH_WEB_PORT);
 
+    uint32_t retry_at=hi_get_milli_seconds()+30000;
+    uint32_t ap_retry_at=retry_at;
     for (;;) {
+        if(!pending_connect&&!g_ap_ready&&strcmp(g_connection,"lan_ready")!=0&&dash_due(hi_get_milli_seconds(),ap_retry_at)){
+            ap_retry_at=hi_get_milli_seconds()+30000;
+            g_ap_ready=wifi_setup_softap();
+        }
+        if(!pending_connect&&strcmp(g_connection,"lan_ready")==0&&!lan_address_ready()){
+            g_connection="disconnected";
+            snprintf(g_wifi_ip,sizeof(g_wifi_ip),"%s",g_ap_ready?"192.168.43.1":"0.0.0.0");
+            retry_at=hi_get_milli_seconds()+30000;
+        }
+        if(!pending_connect&&(credentials_saved||DASH_WIFI_STA_SSID[0])&&strcmp(g_connection,"lan_ready")!=0&&dash_due(hi_get_milli_seconds(),retry_at)){
+            retry_at=hi_get_milli_seconds()+30000;
+            load_network_target();
+            save_requested=false;
+            pending_connect=g_target_ssid[0]!=0;
+            begin_connect();
+        }
+        fd_set readers;
+        FD_ZERO(&readers);
+        FD_SET(srv_fd,&readers);
+        struct timeval tick={.tv_sec=1,.tv_usec=0};
+        if(lwip_select(srv_fd+1,&readers,NULL,NULL,&tick)<=0){hi_sleep(20);continue;}
         struct sockaddr_in cli_addr;
         socklen_t cli_len = sizeof(cli_addr);
         int cli_fd = lwip_accept(srv_fd, (struct sockaddr *)&cli_addr, &cli_len);
@@ -258,8 +324,13 @@ static hi_void *web_server_task(hi_void *arg) {
             continue;
         }
         handle_http_client(cli_fd);
+        memset(http_request, 0, sizeof(http_request));
         lwip_close(cli_fd);
-        begin_connect();
+        if(pending_connect&&!connection_worker){
+            save_requested=true;
+            retry_at=hi_get_milli_seconds()+30000;
+            begin_connect();
+        }
     }
     return HI_NULL;
 }
@@ -274,11 +345,10 @@ void dash_web_start(void) {
     printf("[web] task 0x%x started\r\n", r);
 }
 
-const char *dash_wifi_state(void){
- if(!strcmp(g_connection,"lan_ready"))return "LAN READY (not WAN)";
- if(!strcmp(g_connection,"connecting"))return "WiFi connecting";
- if(!strcmp(g_connection,"not_configured"))return "AP setup ready";
- if(!strcmp(g_connection,"disconnected"))return "WiFi disconnected";
- return "WiFi failed: use AP";
+void dash_wifi_display(char *out,size_t capacity){
+ if(!strcmp(g_connection,"lan_ready"))snprintf(out,capacity,"LAN %s",g_wifi_ip);
+ else if(!strcmp(g_connection,"connecting"))snprintf(out,capacity,"WiFi connecting");
+ else if(!strcmp(g_connection,"not_configured")&&g_ap_ready)snprintf(out,capacity,"AP setup ready");
+ else if(!strcmp(g_connection,"disconnected"))snprintf(out,capacity,"WiFi disconnected");
+ else snprintf(out,capacity,g_ap_ready?"WiFi failed: use AP":"WiFi failed: retry");
 }
-void dash_wifi_address(char *out,size_t capacity){snprintf(out,capacity,"%s",g_wifi_ip);}

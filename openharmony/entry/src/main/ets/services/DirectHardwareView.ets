@@ -15,6 +15,8 @@ export class DirectHardwareView {
   private confirmed: boolean = false;
   private issue: string = 'board_not_configured';
   private revision: number = 0;
+  private pending: Promise<DirectHardwareReading> | undefined = undefined;
+  private pendingRevision: number = -1;
 
   configure(ip: string): void {
     if (ip.length > 0) this.collector.configure(ip);
@@ -29,6 +31,20 @@ export class DirectHardwareView {
   async poll(): Promise<DirectHardwareReading> {
     if (this.ip.length === 0) return this.read();
     const revision = this.revision;
+    if (this.pending !== undefined) {
+      if (this.pendingRevision === revision) return this.pending;
+      await this.pending;
+      if (revision !== this.revision) return this.read();
+      return this.poll();
+    }
+    const work = this.readOnce(revision);
+    this.pending = work;
+    this.pendingRevision = revision;
+    try { return await work; }
+    finally { if (this.pending === work) this.pending = undefined; }
+  }
+
+  private async readOnce(revision: number): Promise<DirectHardwareReading> {
     const sample = await this.collector.pollOnce();
     if (revision !== this.revision) return this.read();
     if (sample.deviceOnline) { this.confirmed = true; this.issue = ''; }

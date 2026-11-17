@@ -39,12 +39,32 @@ static void chinese(unsigned x,unsigned y,const char *s){while(*s&&x+16<=128){bo
  for(unsigned i=0;i<sizeof(glyphs)/sizeof(glyphs[0]);i++)if(!strncmp(s,glyphs[i].utf8,3)){for(unsigned r=0;r<16;r++)for(unsigned c=0;c<16;c++)if(glyphs[i].row[r]&(0x8000u>>c))pixel(x+c,y+r);found=true;break;}
  if(!found)return;
  s+=3;x+=16;}}
+static uint8_t oled_sent[sizeof(pixels)];
+static uint8_t oled_valid_pages;
 static bool oled_init(void){
+ oled_valid_pages=0;
  const uint8_t seq[]={0xae,0xd5,0x80,0xa8,0x3f,0xd3,0,0x40,0x8d,0x14,0x20,2,0xa1,0xc8,0xda,0x12,0x81,0xcf,0xd9,0xf1,0xdb,0x40,0xa4,0xa6,0xaf};
  for(unsigned i=0;i<sizeof(seq);i++)if(command(seq[i]))return false;
  return true;
 }
-static bool oled_flush(void){uint8_t b[129];b[0]=0x40;for(unsigned p=0;p<8;p++){if(command(0xb0+p)||command(0)||command(0x10))return false;memcpy(b+1,pixels+p*128,128);if(write_bus(DASH_OLED_ADDR,b,129))return false;}return true;}
+static bool oled_flush(void){
+ uint8_t block[17]={0x40};
+ for(unsigned page=0;page<8;page++){
+  const uint8_t *current=pixels+page*128;
+  uint8_t *sent=oled_sent+page*128;
+  const uint8_t page_bit=(uint8_t)(1u<<page);
+  if((oled_valid_pages&page_bit)&&memcmp(current,sent,128)==0)continue;
+  const uint8_t address[]={0,0xb0+page,0,0x10};
+  if(write_bus(DASH_OLED_ADDR,address,sizeof(address)))return false;
+  for(unsigned column=0;column<128;column+=16){
+   memcpy(block+1,current+column,16);
+   if(write_bus(DASH_OLED_ADDR,block,sizeof(block)))return false;
+  }
+  memcpy(sent,current,128);
+  oled_valid_pages|=page_bit;
+ }
+ return true;
+}
 static void render(uint32_t now){
  char b[48];memset(pixels,0,sizeof(pixels));chinese(0,0,"系统运行中");
  const char spin[]={'|','/','-','\\'};char anim[2]={spin[(now/250)%4],0};text(115,2,anim,Font_6x8);
@@ -52,10 +72,10 @@ static void render(uint32_t now){
  if(th_ok){unsigned t=temperature10<0?-(int64_t)temperature10:temperature10;snprintf(b,sizeof(b),"T:%s%u.%uC RH:%u.%u%%",temperature10<0?"-":"",t/10,t%10,humidity10/10,humidity10%10);}
  else snprintf(b,sizeof(b),"AHT20: UNKNOWN");text(0,29,b,Font_6x8);
  if(gas_ok)snprintf(b,sizeof(b),"MQ2 RAW:%u",gas_raw);else snprintf(b,sizeof(b),"MQ2: UNKNOWN");text(0,38,b,Font_6x8);
- text(0,47,"CO/CO2: UNKNOWN",Font_6x8);
  hi_u32 weather_irq=hi_int_lock();dash_weather_t wx=weather;hi_int_restore(weather_irq);
- if((now/3000)%4==3)text(0,56,dash_weather_fresh(&wx,now-started)?dash_weather_label(wx.mask):"WX: UNKNOWN/EXPIRED",Font_6x8);
- else if((now/3000)%4==1){dash_wifi_address(b,sizeof(b));text(0,56,b,Font_6x8);}else if((now/3000)%4==2)text(0,56,"WX: LAN UNVERIFIED",Font_6x8);else text(0,56,dash_wifi_state(),Font_6x8);
+ const char *detail=(now/3000)%2?(dash_weather_fresh(&wx,now-started)?dash_weather_label(wx.mask):"WX: UNKNOWN/EXPIRED"):"CO/CO2: UNKNOWN";
+ text(0,47,detail,Font_6x8);
+ dash_wifi_display(b,sizeof(b));text(0,56,b,Font_6x8);
  if(!oled_flush()){oled_ok=false;oled_retry=now+3000;printf("[oled] I2C failed\r\n");}
 }
 bool dash_receive_weather(const char *body){
@@ -127,13 +147,26 @@ static void apply_queued_command(int route_cmd,uint32_t now){
  else if(route_cmd==DASH_ROUTE_CMD_NFC_RECHECK){dash_nfc_force_check();}
 }
 
-size_t dash_pengan_json(char *frame,size_t capacity){
- struct {uint32_t started,th_sampled,gas_sampled;bool th_ok,gas_ok;int temperature10;unsigned humidity10,gas_raw,gas_mv;} snap;
- hi_u32 irq=hi_int_lock();uint32_t now=hi_get_milli_seconds();
- snap.started=started;snap.th_sampled=th_sampled;snap.gas_sampled=gas_sampled;snap.th_ok=th_ok;snap.gas_ok=gas_ok;snap.temperature10=temperature10;snap.humidity10=humidity10;snap.gas_raw=gas_raw;snap.gas_mv=gas_mv;
+static char telemetry_json[512];
+static size_t telemetry_json_len;
+static uint32_t telemetry_published;
+
+static void publish_http_telemetry(uint32_t now){
+ char frame[sizeof(telemetry_json)];
+ int n=snprintf(frame,sizeof(frame),"{\"schemaVersion\":1,\"deviceId\":\"hh-hsp101-001\",\"simulated\":false,\"uptime_ms\":%u,\"th_ok\":%s,\"temperature10\":%d,\"humidity10\":%u,\"gas_ok\":%s,\"gas_raw\":%u,\"gas_mv\":%u,\"th_sample_age_ms\":%u,\"gas_sample_age_ms\":%u,\"coValid\":false,\"co2Valid\":false,\"coPpm\":null,\"co2Ppm\":null,\"controlSupported\":false}",(unsigned)(now-started),th_ok?"true":"false",temperature10,humidity10,gas_ok?"true":"false",gas_raw,gas_mv,(unsigned)(now-th_sampled),(unsigned)(now-gas_sampled));
+ hi_u32 irq=hi_int_lock();
+ telemetry_json_len=n>0&&(size_t)n<sizeof(frame)?(size_t)n:0;
+ if(telemetry_json_len){memcpy(telemetry_json,frame,telemetry_json_len+1);telemetry_published=now;}
  hi_int_restore(irq);
- int n=snprintf(frame,capacity,"{\"schemaVersion\":1,\"deviceId\":\"hh-hsp101-001\",\"simulated\":false,\"uptime_ms\":%u,\"th_ok\":%s,\"temperature10\":%d,\"humidity10\":%u,\"gas_ok\":%s,\"gas_raw\":%u,\"gas_mv\":%u,\"th_sample_age_ms\":%u,\"gas_sample_age_ms\":%u,\"coValid\":false,\"co2Valid\":false,\"coPpm\":null,\"co2Ppm\":null,\"controlSupported\":false}",(unsigned)(now-snap.started),snap.th_ok?"true":"false",snap.temperature10,snap.humidity10,snap.gas_ok?"true":"false",snap.gas_raw,snap.gas_mv,(unsigned)(now-snap.th_sampled),(unsigned)(now-snap.gas_sampled));
- return n>0&&(size_t)n<capacity?(size_t)n:0;
+}
+
+size_t dash_pengan_json(char *frame,size_t capacity){
+ hi_u32 irq=hi_int_lock();
+ size_t count=telemetry_json_len<capacity?telemetry_json_len:0;
+ uint32_t published=telemetry_published;
+ if(count)memcpy(frame,telemetry_json,count+1);
+ hi_int_restore(irq);
+ return count&&(uint32_t)(hi_get_milli_seconds()-published)<1000?count:0;
 }
 static void pengan_telemetry(uint32_t now){
  char frame[512];
@@ -153,10 +186,12 @@ static hi_void *dashboard_task(hi_void *arg){
  hi_io_set_func(HI_IO_NAME_GPIO_13,HI_IO_FUNC_GPIO_13_I2C0_SDA);hi_io_set_func(HI_IO_NAME_GPIO_14,HI_IO_FUNC_GPIO_14_I2C0_SCL);
  hi_i2c_deinit(DASH_I2C);hi_i2c_init(DASH_I2C,400000);hi_sleep(100);oled_ok=oled_init();oled_retry=started+3000;
  const uint8_t init[]={0xbe,8,0};write_bus(DASH_AHT_ADDR,init,3);th_due=hi_get_milli_seconds()+100;
+ uint32_t http_telemetry_due=started;
  for(;;){uint32_t now=hi_get_milli_seconds();hi_gpio_value v=HI_GPIO_VALUE1;
   if(hi_gpio_get_input_val(HI_GPIO_IDX_5,&v)==0){unsigned event=dash_key(&key,v==HI_GPIO_VALUE0,now);if(event==1){page=(page+1)%4;display_due=now;}}
   hi_u32 irq=hi_int_lock();int cmd=0;if(web_tail!=web_head){cmd=web_commands[web_tail];web_tail=(web_tail+1)%8;}hi_int_restore(irq);if(cmd)apply_queued_command(cmd,now);
   gas_tick(now);climate_tick(now);if(dash_due(now,telemetry_due)){telemetry_due=now+2000;pengan_telemetry(now);}
+  if(dash_due(now,http_telemetry_due)){http_telemetry_due=now+250;publish_http_telemetry(now);}
   if(!oled_ok&&dash_due(now,oled_retry)){oled_ok=oled_init();oled_retry=now+3000;}
   if(oled_ok&&dash_due(now,display_due)){display_due=now+250;render(now);}
   hi_sleep(10);

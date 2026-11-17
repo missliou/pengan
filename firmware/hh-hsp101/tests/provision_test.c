@@ -19,25 +19,28 @@ static int hi_open(const char*p,int flags){if(!fs_enabled)return -1;int slot=!st
 static int hi_read(int fd,char*b,unsigned n){if(n>(unsigned)lengths[fd])n=lengths[fd];memcpy(b,files[fd],n);return n;}
 static int hi_write(int fd,const char*b,unsigned n){if(fail_write)n/=2;memcpy(files[fd],b,n);lengths[fd]=n;return n;}
 static int hi_close(int fd){(void)fd;return 0;}
-static bool lan_address_ready(void){return true;}
 static bool sta_start(void){return true;}
 static int hi_wifi_sta_scan(void){return 0;}
 static int hi_wifi_sta_scan_results(hi_wifi_ap_info*a,unsigned*n){*n=1;strcpy(a[0].ssid,"quote\"slash\\<tag>");a[0].rssi=-5000;return 0;}
 static void hi_sleep(int ms){(void)ms;}
-static int lwip_recv(int fd,char*b,size_t n,int f){(void)fd;(void)b;(void)n;(void)f;return -1;}
+static int client_recv(int fd,char*b,size_t n){(void)fd;(void)b;(void)n;return -1;}
 static char sent[20000];static size_t sent_len;
 static void send_all(int fd,const char*b,size_t n){(void)fd;assert(sent_len+n<sizeof(sent));memcpy(sent+sent_len,b,n);sent_len+=n;sent[sent_len]=0;}
 static size_t dash_pengan_json(char*b,size_t n){return snprintf(b,n,"{\"schemaVersion\":1}");}
 #include "../src/dash_weather.h"
 static bool dash_receive_weather(const char *body){dash_weather_t w={0};return dash_weather_parse(body,10000,&w);}
 #include "../src/dash_provision.h"
-static void call(const char*text){char req[3072];snprintf(req,sizeof(req),"%s",text);sent_len=0;assert(provision_route(0,req,strlen(req)));}
+static void call(const char*text){char req[3072],body[4096];snprintf(req,sizeof(req),"%s",text);sent_len=0;assert(provision_route(0,req,strlen(req),body,sizeof(body)));}
 int main(void){
  const char *weather_body="PGWX1 5 -20 100 180 0 600 9000";char weather_req[512];
  snprintf(weather_req,sizeof(weather_req),"POST /api/pengan/weather HTTP/1.1\r\nContent-Type: application/x-pengan-weather\r\nContent-Length: %u\r\n\r\n%s",(unsigned)strlen(weather_body),weather_body);call(weather_req);assert(strstr(sent,"202")&&strstr(sent,"authenticated\":false"));
  snprintf(weather_req,sizeof(weather_req),"POST /api/pengan/weather HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Type: application/x-pengan-weather\r\nContent-Length: %u\r\n\r\n%s",(unsigned)strlen(weather_body),weather_body);call(weather_req);assert(strstr(sent,"403"));
  char out[33];assert(form_value("ssid=abc%26def&key=x","ssid",out,sizeof(out))&&!strcmp(out,"abc&def"));assert(!form_value("ssid=%00bad","ssid",out,sizeof(out)));assert(!form_value("ssid=%zz","ssid",out,sizeof(out)));assert(form_value("ssid=%E4","ssid",out,sizeof(out))&&!utf8_valid(out));assert(form_value("ssid=%E5%AE%B6%E9%87%8C","ssid",out,sizeof(out))&&utf8_valid(out));
  call("GET /api/pengan/telemetry HTTP/1.1\r\n\r\n");assert(strstr(sent,"200 OK")&&strstr(sent,"Cache-Control: no-store")&&strstr(sent,"schemaVersion"));
+ for(unsigned i=0;i<100;i++){
+  call("POST /api/wifi/connect HTTP/1.1\r\nOrigin: http://192.168.43.1\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 24\r\n\r\nssid=");assert(strstr(sent,"incomplete_body"));
+  call("GET /api/pengan/telemetry HTTP/1.1\r\n\r\n");assert(strstr(sent,"200 OK")&&strstr(sent,"schemaVersion"));
+ }
  call("GET /api/wifi/scan HTTP/1.1\r\n\r\n");assert(strstr(sent,"quote\\\"slash\\\\<tag>")&&strstr(sent,"-50"));
  call("POST /api/wifi/connect HTTP/1.1\r\nContent-Length: 24\r\n\r\nssid=test&key=password12");assert(strstr(sent,"403"));
  call("POST /api/wifi/connect HTTP/1.1\r\nOrigin: http://evil.test\r\nContent-Length: 24\r\n\r\nssid=test&key=password12");assert(strstr(sent,"403"));

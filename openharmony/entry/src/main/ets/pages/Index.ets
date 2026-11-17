@@ -1,5 +1,6 @@
 import {OfflineQueue} from '../services/OfflineQueue';
 import {CredentialVault} from '../services/CredentialVault';
+import { LOCAL_DEMO_BASE, LOCAL_DEMO_ID, LOCAL_DEMO_TOKEN } from '../model/LocalDemoConfig';
 import {NativeSpeechInput} from '../services/NativeSpeechInput';
 import {GreenhouseMotionImage, NativeBusyIndicator} from '../services/NativeMotion';
 import {NativeCropReview,cropReviewLabel} from '../services/NativeCropReviews';
@@ -93,6 +94,7 @@ struct Index {
   @State cloudGatewayId: string = '';
   @State cloudTokenInput: string = '';
   @State cloudUploadStatus: string = '尚未启用设备云端会话';
+  private liveUploadBusy: boolean = false;
   @State cloudSessionReady: boolean = false;
   @State analysisHistoryRows: string[] = [];
   @State analysisHistoryStatus: string = '尚未读取AI文字分析历史';
@@ -169,7 +171,7 @@ struct Index {
     Promise.resolve().then(() => this.offlineQueue.open(this.requireAbilityContext())).then(() => { this.queueReady = true; this.queueStatus = '本地待发 '+this.offlineQueue.count().toString()+' 条'; }).catch(() => { this.queueStatus = '离线队列不可用，原数据保留'; });
     Promise.resolve().then(() => this.credentialVault.open(this.requireAbilityContext())).catch(() => { this.credentialStatus = '凭据保护不可用，仅使用内存会话'; });
     this.hardwareTimer = setInterval(() => {
-      if (!this.hardwareVisible || (this.currentPage !== 0 && this.currentPage !== 5)) return;
+      if (!this.hardwareVisible) return;
       if (!this.demoMode && this.hardwareSource === 'direct' && this.directSettingsReady) {
         this.hardwareStatus = this.directHardware.read().text;
       }
@@ -180,21 +182,23 @@ struct Index {
       if (Date.now() - this.hardwarePollAt >= 2000) this.pollHardware();
       if (!this.demoMode && this.cloudUpload.configured() && Date.now()-this.lastReplayAt>=10000) this.replayPending();
     }, 1000);
-    Promise.resolve().then(() => this.directSettings.open(this.requireAbilityContext())).then((config: DirectConnectionConfig) => {
+    const directLoad = Promise.resolve().then(() => this.directSettings.open(this.requireAbilityContext())).then((config: DirectConnectionConfig) => {
       this.invalidateConnection(); this.resetHardware('采集配置已载入');
-      this.hardwareSource = config.mode; this.hardwareSourceDraft = config.mode;
+      this.hardwareSource = LOCAL_DEMO_BASE ? 'direct' : config.mode; this.hardwareSourceDraft = this.hardwareSource;
       this.boardIp = config.boardIp; this.savedBoardIp = config.boardIp;
       this.directHardware.configure(config.boardIp); this.directSettingsReady = true;
-      this.directSettingsStatus = '配置已载入；' + (config.mode === 'direct' ? 'DAYU200直接读取采集板，未上传云端' : '电脑临时网关采集，非正式端云链路');
+      this.directSettingsStatus = '配置已载入；' + (this.hardwareSource === 'direct' ? 'DAYU200直接读取采集板' : '电脑临时网关采集，非正式端云链路');
       this.pollHardware();
     }).catch((error: Error) => { this.directSettingsReady = false; this.directSettingsStatus = error.message; });
     Promise.resolve().then(() => this.connectionSettings.open(this.requireAbilityContext())).then((address: string) => {
+      if (LOCAL_DEMO_BASE) address = LOCAL_DEMO_BASE;
       this.resetHardware('服务地址已变化，等待读取真实采集');
       this.gateway.configure(address);
       this.gatewayAddress = address;
       this.savedGatewayAddress = address;
       this.settingsReady = true;
       this.connectionStatus = '已载入配置，尚未测试连接';
+      if (LOCAL_DEMO_BASE) directLoad.then(() => this.startLocalDemoSession());
     }).catch(() => { this.settingsReady = false; this.connectionStatus = '配置未载入：上下文或存储不可用，请返回前台重试或重启应用'; });
     this.auditReady = Promise.resolve().then(() => this.auditStore.open(this.requireAbilityContext()));
     this.auditReady.then(() => {
@@ -416,30 +420,41 @@ struct Index {
   }
 
   private async requestHardwareAnalysis(text: string): Promise<void> {
-    if (this.settingsBusy || this.directSettingsBusy || !this.hardwareVisible) return;
+    if (this.settingsBusy || this.directSettingsBusy || !this.settingsReady || this.modelBusy || !this.hardwareVisible) return;
     if (this.hardwareSource === 'direct' && !this.cloudSessionReady) {
       this.messages = [...this.messages, new ChatMessage(this.messages.length + 1, false, '当前为DAYU200本地直采，认证端云上报尚未接通，未向旧网关发送环境分析请求。照片分析和合成模型测试可独立使用；本地读数未上传云端。')];
       return;
     }
-    if (this.modelBusy || !this.settingsReady) return;
     const epoch = this.connectionEpoch;
     const hardwareEpoch = this.hardwareEpoch;
     this.modelBusy = true;
     try {
-      // Page changes deliberately clear visible samples. Fetch a genuine frame
-      // here, then require its upload receipt before analyzing this device session.
       let expectedSession: string = '';
       if (this.hardwareSource === 'direct') {
-        await this.directHardware.poll();
+        const reading = await this.directHardware.poll();
         if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch || !this.hardwareVisible || this.demoMode) return;
-        const sample = this.directHardware.uploadSample();
-        const receipt = await this.sendLiveSample(sample);
-        if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch || !this.hardwareVisible || this.demoMode) return;
-        expectedSession = sample.sessionBootId;
-        this.cloudUploadStatus = receipt;
+        if (reading.deviceOnline) {
+          try {
+            const sample = this.directHardware.uploadSample();
+            const receipt = await this.sendLiveSample(sample);
+            if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch || !this.hardwareVisible || this.demoMode) return;
+            this.cloudUploadStatus = receipt;
+            expectedSession = sample.sessionBootId;
+          } catch (error) {
+            if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch) return;
+            this.cloudUploadStatus = '当前帧上报未确认：' + (error as Error).message;
+          }
+          if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch || !this.hardwareVisible || this.demoMode) return;
+        }
       }
-      const analysis = this.hardwareSource === 'direct' ? await this.cloudUpload.analyze(text, expectedSession) : await this.gateway.analyze(text);
+      const generalOnly = this.hardwareSource === 'direct' && expectedSession.length === 0;
+      const analysis = this.hardwareSource === 'direct' ? await this.cloudUpload.analyze(text, expectedSession, generalOnly) : await this.gateway.analyze(text);
       if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch || this.demoMode) return;
+      if (generalOnly) {
+        const reply = '通用农业建议 · 未使用现场读数或历史\n' + analysis.summary + '\n' + analysis.findings.join('\n');
+        this.messages = [...this.messages, new ChatMessage(this.messages.length + 1, false, reply)];
+        return;
+      }
       const basis = analysis.deviceOnline ? '分析时采集在线，网关接收：' + new Date(analysis.observationReceivedAt as number).toLocaleString() : '分析时设备离线或样本过期，没有有效现场读数';
       const traceText = analysis.toolTrace === undefined ? '服务端未提供工具读取记录' : analysis.toolTrace.map((trace: AnalysisToolTrace) => (trace.tool === 'read_environment' ? '已读取真实当前观测' : '已读取真实历史') + ' · ' + new Date(trace.at).toLocaleString() + ' · ' + trace.resultSummary).join('\n');
       const savedText = analysis.persistence === undefined ? '服务端未提供保存状态，不能视为已保存' : analysis.persistence.saved ? '文字分析已保存到服务端历史' + (analysis.persistence.recordId === undefined ? '' : ' · #' + analysis.persistence.recordId.toString()) : '文字分析未保存，可稍后检查服务端存储状态';
@@ -447,7 +462,7 @@ struct Index {
       this.messages = [...this.messages, new ChatMessage(this.messages.length + 1, false, reply)];
     } catch (error) {
       if (epoch !== this.connectionEpoch || hardwareEpoch !== this.hardwareEpoch || this.demoMode) return;
-      this.messages = [...this.messages, new ChatMessage(this.messages.length + 1, false, '真实AI请求失败：' + (error as Error).message + '。请在独立Web管理平台配置服务商、模型及密钥，并检查服务端连接；未生成或执行设备指令。')];
+      this.messages = [...this.messages, new ChatMessage(this.messages.length + 1, false, '农业助手请求失败：' + (error as Error).message + '。可以重试，也可在设备诊断测试模型连接。')];
     } finally { if (epoch === this.connectionEpoch) this.modelBusy = false; }
   }
 
@@ -671,7 +686,8 @@ struct Index {
       Button({ type: ButtonType.Normal }) {
         Column({ space: 8 }) {
           Text('设备与连接 →').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#0F172A').width('100%')
-          Text('采集来源 · 云端配置').fontSize(12).fontColor('#64748B').width('100%')
+          Text(this.hardwareSource === 'direct' && !this.cloudSessionReady ? '待配置：设备云端会话' : '采集来源 · 云端配置')
+            .fontSize(12).fontColor(this.hardwareSource === 'direct' && !this.cloudSessionReady ? '#B45309' : '#64748B').width('100%')
         }.padding(16).width('100%')
       }.layoutWeight(1).backgroundColor(Color.White).borderRadius(14).stateEffect(true)
         .scale({ x: this.pressedShortcut === 1 ? 0.97 : 1, y: this.pressedShortcut === 1 ? 0.97 : 1 })
@@ -873,8 +889,8 @@ struct Index {
                 .fontSize(13.5).fontColor('#64748B').width('100%')
             }
           } else {
-            Text('真实采集 AI 分析').fontSize(20).fontWeight(FontWeight.Bold).fontColor('#0F172A').width('100%')
-            Text(this.hardwareSource === 'direct' ? (this.cloudSessionReady ? '使用已登记设备的云端观测分析，核对本地会话；请先在设备诊断确认上报成功，未执行设备。' : '请先在设备诊断启用HTTPS设备云端会话；未配置时不会向旧网关请求环境分析。') : '临时网关模式：输入及服务端当前温湿度/ADC观测交给已配置模型；不是DAYU200本地直采数据，不执行设备。')
+            Text('农业问答与环境分析').fontSize(20).fontWeight(FontWeight.Bold).fontColor('#0F172A').width('100%')
+            Text(this.hardwareSource === 'direct' ? (this.cloudSessionReady ? '现场数据上报成功时结合采集回答；采集未确认时提供通用农业建议。' : '请先在设备诊断启用设备云端会话。') : '临时网关模式使用服务端观测回答。')
               .fontSize(14.5).lineHeight(22).fontColor('#475569').width('100%')
           }
           if (this.messages.length === 0) {
@@ -897,7 +913,7 @@ struct Index {
             TextInput({ placeholder: '分析当前采集 / 养护建议 / 数据缺失原因', text: this.input })
               .fontSize(16).height(46).borderRadius(10).layoutWeight(1)
               .maxLength(300).onChange((value: string) => { this.input = value; })
-            Button(this.modelBusy ? '处理中' : '发送').fontSize(15.5).height(46).borderRadius(10).constraintSize({ maxWidth: '96%' }).backgroundColor('#0F766E').enabled(!this.modelBusy).onClick(() => { this.sendMessage(); })
+            Button(this.modelBusy ? '处理中' : '发送').fontSize(15.5).height(46).borderRadius(10).constraintSize({ maxWidth: '96%' }).backgroundColor('#0F766E').enabled(!this.modelBusy && (this.demoMode || (this.settingsReady && !this.settingsBusy && !this.directSettingsBusy))).onClick(() => { this.sendMessage(); })
           }.width('100%')
           if (!this.demoMode) {
             Text('语音转写只回填，不自动提交；请确认现场人员同意录音。').fontSize(14).fontColor('#475569').width('100%')
@@ -1191,17 +1207,25 @@ struct Index {
       }.padding(16).backgroundColor(Color.White).borderRadius(14).width('100%')
       // 卡片 1：设备云端会话（HTTPS）
       Column({ space: 14 }) {
-        Text('1. 设备云端会话（HTTPS）').fontSize(20).fontWeight(FontWeight.Bold).fontColor('#0F172A').width('100%')
+        Text(this.cloudUpload.demoTlsBypass() && this.cloudSessionReady ? '1. 设备云端会话（演示 · 明文HTTP）' : '1. 设备云端会话（HTTPS）').fontSize(20).fontWeight(FontWeight.Bold).fontColor('#0F172A').width('100%')
         TextInput({ text: this.cloudGatewayId, placeholder: '管理员登记的DAYU200 ID' })
           .fontSize(16).height(46).borderRadius(10).onChange((v: string) => { this.cloudGatewayId = v; })
         TextInput({ text: this.cloudTokenInput, placeholder: '设备令牌（可选HUKS保护）' })
           .fontSize(16).height(46).borderRadius(10).type(InputType.Password).onChange((v: string) => { this.cloudTokenInput = v; })
-        Text('云端地址使用下方已保存服务端地址。令牌仅驻留内存，可选HUKS密文保存并手动恢复；不要输入模型API密钥。')
+        if (this.cloudSessionReady && this.cloudUpload.demoTlsBypass()) {
+          Row({ space: 8 }) {
+            Text('⚠').fontSize(16).fontColor('#B45309')
+            Text('演示模式：明文HTTP，令牌与数据在局域网内可被抓包。仅限本地演示，结束后请关闭会话并改回HTTPS。')
+              .fontSize(13.5).lineHeight(20).fontColor('#B45309').layoutWeight(1)
+          }.width('100%').padding(12).backgroundColor('#FFFBEB').borderRadius(10)
+          .border({ width: 1, color: '#FDE68A' })
+        }
+        Text('云端地址使用下方已保存服务端地址。演示联调可填私有局域网明文HTTP地址（如 http://192.168.1.20:5201），此时令牌与数据不加密，仅限本机演示；公网仍必须HTTPS。令牌仅驻留内存，可选HUKS密文保存并手动恢复；不要输入模型API密钥。')
           .fontSize(14).lineHeight(21).fontColor('#64748B').width('100%')
         Flex({ wrap: FlexWrap.Wrap }) {
           Button(this.cloudSessionReady ? '替换设备云端会话' : '启用设备云端会话').fontSize(15).height(44).borderRadius(10).backgroundColor('#0F766E').margin({ right: 8, bottom: 8 }).enabled(!this.modelBusy && !this.settingsBusy).onClick(() => {
             const token = this.cloudTokenInput; this.cloudTokenInput = '';
-            try { this.cloudUpload.configure(this.savedGatewayAddress, this.cloudGatewayId.trim(), token); this.invalidateConnection(); this.resetHardware('设备云端会话已变化'); this.lastUploadAttempt = ''; this.cloudSessionReady = true; this.cloudUploadStatus = '已配置会话，尚未确认服务器接收；新有效帧自动上报一次'; }
+            try { this.cloudUpload.configure(this.savedGatewayAddress, this.cloudGatewayId.trim(), token); this.invalidateConnection(); this.resetHardware('设备云端会话已变化'); this.lastUploadAttempt = ''; this.cloudSessionReady = true; this.cloudUploadStatus = (this.cloudUpload.demoTlsBypass() ? '已配置演示会话（明文HTTP局域网，令牌不加密，仅限本地演示）；新有效帧自动上报一次' : '已配置会话，尚未确认服务器接收；新有效帧自动上报一次'); }
             catch (error) { this.cloudUploadStatus = (error as Error).message; }
           })
           Button('关闭设备云端会话').fontSize(15).height(44).borderRadius(10).backgroundColor('#FEE2E2').fontColor('#DC2626').margin({ right: 8, bottom: 8 }).onClick(() => { this.cloudUpload.clear(); this.invalidateConnection(); this.resetHardware('设备云端会话已关闭'); this.cloudSessionReady = false; this.cloudTokenInput = ''; this.cloudUploadStatus = '设备云端会话已关闭'; })
@@ -1245,8 +1269,8 @@ struct Index {
           .onChange((value: string) => { this.boardIp = value; }).enabled(this.directSettingsReady && !this.directSettingsBusy)
         Text('已保存采集板IP：' + (this.savedBoardIp || '未配置') + '。两块板子需在同一局域网；固定HTTP 80端口与遥测路径，不填密码。')
           .fontSize(14).lineHeight(21).fontColor('#64748B').width('100%')
-        Button(this.directSettingsBusy ? '保存中' : '保存采集来源').fontSize(15.5).height(44).borderRadius(10).backgroundColor('#0F766E').constraintSize({ maxWidth: '96%' })
-          .enabled(this.directSettingsReady && !this.directSettingsBusy && !this.settingsBusy && !this.modelBusy && !this.hardwareTransportBusy && !this.imageAnalysisBusy && !this.realReportBusy && !this.remoteMode)
+        Button(this.directSettingsBusy ? '保存中' : '保存采集板 IP 和来源').fontSize(15.5).height(44).borderRadius(10).backgroundColor('#0F766E').constraintSize({ maxWidth: '96%' })
+          .enabled(this.directSettingsReady && !this.directSettingsBusy && !this.settingsBusy && !this.remoteMode)
           .onClick(() => { this.saveHardwareSource(); })
         Text(this.directSettingsStatus).fontSize(15).fontColor('#334155').width('100%')
       }
@@ -1265,7 +1289,15 @@ struct Index {
           .onChange((value: string) => { this.gatewayAddress = value; })
           .enabled(this.settingsReady && !this.settingsBusy && !this.remoteMode)
         Text('当前保存地址：' + this.savedGatewayAddress).fontSize(15).fontColor('#334155').width('100%')
-        Text('填写云端HTTPS地址或电脑临时测试地址。直采不依赖此地址；认证上报未实现，当前服务端照片分析/合成测试独立使用此连接。')
+        if (this.savedGatewayAddress.startsWith('http://')) {
+          Row({ space: 8 }) {
+            Text('⚠').fontSize(16).fontColor('#B45309')
+            Text('当前服务端地址为明文HTTP（演示配置）。局域网内令牌与上报数据不加密。')
+              .fontSize(13.5).lineHeight(20).fontColor('#B45309').layoutWeight(1)
+          }.width('100%').padding(12).backgroundColor('#FFFBEB').borderRadius(10)
+          .border({ width: 1, color: '#FDE68A' })
+        }
+        Text('填写云端HTTPS地址，演示时也可填私有局域网明文HTTP地址（HTTP仅放行回环与私有局域网）。直采不依赖此地址。')
           .fontSize(14).lineHeight(21).fontColor('#64748B').width('100%')
         Flex({ wrap: FlexWrap.Wrap }) {
           Button('保存地址').fontSize(15).height(42).borderRadius(10).backgroundColor('#0F766E').constraintSize({ maxWidth: '96%' }).margin({ right: 8, bottom: 8 }).enabled(this.settingsReady && !this.settingsBusy && !this.remoteMode && !this.modelBusy && !this.gatewayBusy)
@@ -1390,7 +1422,7 @@ struct Index {
     if (index !== this.currentPage) this.resetHardware('页面已切换，等待读取');
     this.currentPage = index;
     if (index === 4 && !this.demoMode) { const recordEpoch = this.hardwareEpoch; this.refreshHistory().then(() => { if (recordEpoch === this.hardwareEpoch && this.currentPage === 4 && !this.demoMode) this.refreshAnalysisHistory(); }); }
-    this.pollHardware();
+    if (index === 0 || index === 5) this.pollHardware();
   }
 
   private async refreshCropReviews(): Promise<void> {
@@ -1465,7 +1497,7 @@ struct Index {
   }
 
   private async pollHardware(): Promise<void> {
-    if (this.demoMode || (this.hardwareSource === 'direct' ? !this.directSettingsReady : !this.settingsReady) || this.settingsBusy || this.directSettingsBusy || this.hardwareBusy || this.hardwareTransportBusy || !this.hardwareVisible || (this.currentPage !== 0 && this.currentPage !== 5)) return;
+    if (this.demoMode || (this.hardwareSource === 'direct' ? !this.directSettingsReady || this.modelBusy : !this.settingsReady || (this.currentPage !== 0 && this.currentPage !== 5)) || this.settingsBusy || this.directSettingsBusy || this.hardwareBusy || this.hardwareTransportBusy || !this.hardwareVisible) return;
     const epoch = this.hardwareEpoch;
     this.hardwareBusy = true;
     this.hardwareTransportBusy = true;
@@ -1501,6 +1533,11 @@ struct Index {
     this.settingsBusy = true;
     try {
       const address = await this.connectionSettings.save(this.gatewayAddress);
+      if (address === this.savedGatewayAddress) {
+        this.gatewayAddress = address;
+        this.connectionStatus = '已保存当前地址，继续使用现有设备会话。';
+        return;
+      }
       this.cloudUpload.clear(); this.cloudSessionReady = false;
       this.invalidateConnection();
       this.resetHardware('服务地址已变化，等待读取真实采集');
@@ -1526,23 +1563,21 @@ struct Index {
   }
 
   private async uploadCurrentFrame(): Promise<void> {
-    const epoch = this.connectionEpoch; let queued = false;
+    if (this.liveUploadBusy || this.replayBusy) return;
+    const epoch = this.connectionEpoch;
+    this.liveUploadBusy = true;
     try {
-      const sample = this.directHardware.uploadSample(), target = this.cloudUpload.queueTarget();
+      const sample = this.directHardware.uploadSample();
       const key = sample.sessionBootId + '/' + sample.frameJson;
       if (key === this.lastUploadAttempt || !this.hardwareVisible || this.demoMode || this.hardwareSource !== 'direct') return;
-      if (!this.queueReady) throw new Error('离线队列尚未就绪');
-      await this.offlineQueue.enqueue(sample,target); queued = true; this.lastUploadAttempt = key;
-      this.queueStatus = '本地待发 '+this.offlineQueue.count().toString()+' 条';
-      if(epoch!==this.connectionEpoch||!this.hardwareVisible||this.demoMode)return;
       const status = await this.sendLiveSample(sample);
-      await this.offlineQueue.acknowledge(target,[key]);
-      if (epoch === this.connectionEpoch && this.hardwareVisible) { this.cloudUploadStatus = status; this.queueStatus = '本地待发 '+this.offlineQueue.count().toString()+' 条'; }
-    } catch (error) { if (epoch === this.connectionEpoch) this.cloudUploadStatus = '实时上报未确认：' + (error as Error).message + (queued ? '；已持久化，等待历史补发' : '；本帧未确认入队，请检查队列状态'); }
+      if (epoch === this.connectionEpoch && this.hardwareVisible) { this.lastUploadAttempt = key; this.cloudUploadStatus = status; }
+    } catch (error) { if (epoch === this.connectionEpoch) this.cloudUploadStatus = '实时上报未确认：' + (error as Error).message + '。请查看本地待发数。'; }
+    finally { this.liveUploadBusy = false; }
   }
 
   private async replayPending(): Promise<void> {
-    if(this.replayBusy||!this.queueReady||!this.hardwareVisible||this.demoMode||!this.cloudUpload.configured()||this.modelBusy||this.photoUploadBusy||this.speechBusy)return;
+    if(this.liveUploadBusy||this.replayBusy||!this.queueReady||!this.hardwareVisible||this.demoMode||!this.cloudUpload.configured()||this.modelBusy||this.photoUploadBusy||this.speechBusy)return;
     this.replayBusy=true;this.lastReplayAt=Date.now();const epoch=this.connectionEpoch;
     try{
       const target=this.cloudUpload.queueTarget(),rows=this.offlineQueue.batch(target);
@@ -1559,7 +1594,7 @@ struct Index {
     catch(error){this.credentialStatus=(error as Error).message;}
   }
   private async restoreCredentials(): Promise<void> {
-    try{const saved=await this.credentialVault.restore();if(saved.base!==this.savedGatewayAddress)throw new Error('保存的HTTPS地址不匹配，请先核对连接配置');
+    try{const saved=await this.credentialVault.restore();if(saved.base!==this.savedGatewayAddress)throw new Error('保存的云端地址不匹配，请先核对连接配置');
       this.cloudUpload.configure(saved.base,saved.id,saved.token);this.invalidateConnection();this.resetHardware('安全会话已恢复');this.cloudGatewayId=saved.id;this.cloudSessionReady=true;this.lastUploadAttempt='';this.credentialStatus='已恢复HUKS保护的会话';}
     catch(error){this.credentialStatus=(error as Error).message;}
   }
@@ -1574,7 +1609,7 @@ struct Index {
   }
 
   private async saveHardwareSource(): Promise<void> {
-    if (!this.directSettingsReady || this.directSettingsBusy || this.settingsBusy || this.modelBusy || this.hardwareTransportBusy || this.imageAnalysisBusy || this.realReportBusy || this.remoteMode) return;
+    if (!this.directSettingsReady || this.directSettingsBusy || this.settingsBusy || this.remoteMode) return;
     this.directSettingsBusy = true;
     this.directSettingsStatus = '正在保存，当前来源尚未切换';
     try {
@@ -1584,7 +1619,7 @@ struct Index {
       this.boardIp = config.boardIp; this.savedBoardIp = config.boardIp;
       this.directHardware.configure(config.boardIp);
       this.messages = [];
-      this.directSettingsStatus = '保存完成；' + (config.mode === 'direct' ? '仅本地直采，尚未认证上报云端' : '电脑临时网关模式，使用服务端观测/历史');
+      this.directSettingsStatus = config.mode === 'direct' ? '已保存采集板 IP：' + config.boardIp + '，等待读取新地址。' : '已保存临时网关模式。';
     } catch (error) {
       this.directSettingsReady = this.directSettings.isReady();
       this.directSettingsStatus = (error as Error).message;
@@ -1596,9 +1631,49 @@ struct Index {
     if (!this.settingsReady || this.settingsBusy || this.remoteMode) return;
     this.settingsBusy = true;
     this.connectionStatus = '正在测试已保存的服务地址';
-    try { this.connectionStatus = this.demoMode ? await this.gateway.testConnection() : await this.gateway.testHardware(); }
+    try {
+      if (this.demoMode) {
+        this.connectionStatus = await this.gateway.testConnection();
+      } else if (this.hardwareSource === 'direct') {
+        if (!this.cloudSessionReady) {
+          this.connectionStatus = '请先在设备云端会话中填写设备 ID 和令牌并启用，再测试云端连接。';
+          return;
+        }
+        await this.cloudUpload.verifySession();
+        this.connectionStatus = '云端已连接，设备凭据验证通过。采集板连接和数据上报状态请查看采集诊断。';
+      } else {
+        this.connectionStatus = await this.gateway.testHardware();
+      }
+    }
     catch (error) { this.connectionStatus = '连接测试失败：' + (error as Error).message; }
     finally { this.settingsBusy = false; }
+  }
+
+  private async startLocalDemoSession(): Promise<void> {
+    this.settingsBusy = true;
+    this.cloudUploadStatus = '正在验证内置局域网会话';
+    try {
+      this.cloudUpload.configure(LOCAL_DEMO_BASE, LOCAL_DEMO_ID, LOCAL_DEMO_TOKEN);
+      this.cloudGatewayId = LOCAL_DEMO_ID;
+      await this.cloudUpload.verifySession();
+      this.cloudSessionReady = true;
+      this.connectionStatus = '云端已连接，设备凭据验证通过。';
+      this.cloudUploadStatus = this.connectionStatus;
+      try {
+        await this.cloudUpload.reportConsole('native_session_verified');
+        this.cloudUploadStatus += ' 服务器已接收诊断事件。';
+      } catch {
+        this.cloudUploadStatus += ' 服务器尚未确认诊断事件。';
+      }
+    } catch (error) {
+      this.cloudSessionReady = false;
+      this.cloudUpload.clear();
+      this.cloudUploadStatus = '内置会话连接失败：' + (error as Error).message;
+      this.connectionStatus = this.cloudUploadStatus;
+    } finally {
+      this.settingsBusy = false;
+      this.pollHardware();
+    }
   }
 
   private invalidateConnection(): void {

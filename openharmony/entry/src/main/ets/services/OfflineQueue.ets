@@ -1,6 +1,7 @@
 import preferences from '@ohos.data.preferences';
 import common from '@ohos.app.ability.common';
 import {CloudSample,QueuedSample} from './CloudUpload';
+import {normalizeGatewayAddress} from './ConnectionSettings';
 export class OfflineQueue {
   private store: preferences.Preferences | undefined = undefined;
   private rows: QueuedSample[] = [];
@@ -15,10 +16,17 @@ export class OfflineQueue {
     this.rows = rows; this.ready = true;
   }
   private valid(row: QueuedSample): boolean {
-    return !!row && typeof row.target === 'string' && row.target.startsWith('https://') && row.target.length < 600 &&
+    return !!row && this.validTarget(row.target) &&
       typeof row.sessionBootId === 'string' && /^[A-Za-z0-9_.:-]{1,80}$/.test(row.sessionBootId) &&
       Number.isSafeInteger(row.capturedAt) && row.capturedAt > 0 && Number.isSafeInteger(row.sampleAgeMs) && row.sampleAgeMs >= 0 && row.sampleAgeMs < 10000 &&
       typeof row.frameJson === 'string' && row.frameJson.length <= 4096 && typeof row.key === 'string' && row.key === row.sessionBootId + '/' + row.frameJson;
+  }
+  private validTarget(target: string): boolean {
+    if (typeof target !== 'string' || target.length >= 600) return false;
+    const parts = target.split('|');
+    if (parts.length !== 2 || !/^[A-Za-z0-9_.:-]{1,80}$/.test(parts[1])) return false;
+    try { return normalizeGatewayAddress(parts[0]) === parts[0]; }
+    catch { return false; }
   }
   count(): number { return this.rows.length; }
   private async persist(rows: QueuedSample[]): Promise<void> {

@@ -53,7 +53,7 @@ static bool utf8_valid(const char *text){
  }return true;
 }
 static size_t quote_json(char *out,size_t cap,const char *in){size_t n=0;if(cap<3)return 0;out[n++]='"';if(!utf8_valid(in))in="";for(size_t i=0;in[i]&&i<32;i++){unsigned char c=in[i];if(c<32)c='?';if(c=='"'||c=='\\'){if(n+2>=cap)return 0;out[n++]='\\';}if(n+1>=cap)return 0;out[n++]=c;}out[n++]='"';out[n]=0;return n;}
-static bool provision_route(int fd,char *req,size_t used){
+static bool provision_route(int fd,char *req,size_t used,char *body,size_t body_capacity){
  if(strncmp(req,"POST /api/pengan/weather HTTP/1.1\r\n",strlen("POST /api/pengan/weather HTTP/1.1\r\n"))==0){
   /* Native-only custom MIME: deny browsers and chunking; never accepts credentials. */
   char *header_end=strstr(req,"\r\n\r\n");
@@ -63,15 +63,14 @@ static bool provision_route(int fd,char *req,size_t used){
   if(strstr(req,"\r\norigin:")||strstr(req,"\r\ntransfer-encoding:")||!strstr(req,"\r\ncontent-type: application/x-pengan-weather\r\n")||!length||sscanf(length,"\r\ncontent-length: %u%n",&count,&consumed)!=1||strncmp(length+consumed,"\r\n",2)||count>100||!count){reply(fd,403,"application/json","{\"error\":\"weather_native_only\"}");return true;}
   size_t offset=(size_t)(header_end+4-req);
   if(offset+count>=3072){reply(fd,413,"application/json","{\"error\":\"weather_too_large\"}");return true;}
-  while(used<offset+count){int more=lwip_recv(fd,req+used,offset+count-used,0);if(more<=0)return true;used+=more;req[used]=0;}
+  while(used<offset+count){int more=client_recv(fd,req+used,offset+count-used);if(more<=0)return true;used+=more;req[used]=0;}
   if(used!=offset+count||memchr(req+offset,0,count)||!dash_receive_weather(req+offset)){reply(fd,400,"application/json","{\"error\":\"weather_invalid_or_stale\"}");return true;}
   reply(fd,202,"application/json","{\"saved\":true,\"informationalOnly\":true,\"authenticated\":false}");return true;
  }
- if(strncmp(req,"GET /api/pengan/telemetry ",strlen("GET /api/pengan/telemetry "))==0){char json[512];size_t n=dash_pengan_json(json,sizeof(json));reply(fd,n?200:503,"application/json",n?json:"{\"error\":\"telemetry_unavailable\"}");return true;}
+ if(strncmp(req,"GET /api/pengan/telemetry ",strlen("GET /api/pengan/telemetry "))==0){size_t n=dash_pengan_json(body,body_capacity);reply(fd,n?200:503,"application/json",n?body:"{\"error\":\"telemetry_unavailable\"}");return true;}
  if(strncmp(req,"GET / ",strlen("GET / "))==0){reply(fd,200,"text/html; charset=utf-8",setup_html);return true;}
  if(strncmp(req,"GET /api/wifi/status ",strlen("GET /api/wifi/status "))==0){
-  if(strcmp(g_connection,"lan_ready")==0&&!lan_address_ready()){g_connection="disconnected";snprintf(g_wifi_ip,sizeof(g_wifi_ip),"0.0.0.0");}
-  char body[220];snprintf(body,sizeof(body),"{\"state\":\"%s\",\"ip\":\"%s\",\"credentialsSaved\":%s,\"internetVerified\":false}",g_connection,g_wifi_ip,credentials_saved?"true":"false");reply(fd,200,"application/json",body);return true;
+  snprintf(body,body_capacity,"{\"state\":\"%s\",\"ip\":\"%s\",\"credentialsSaved\":%s,\"internetVerified\":false}",g_connection,g_wifi_ip,credentials_saved?"true":"false");reply(fd,200,"application/json",body);return true;
  }
  if(strncmp(req,"GET /api/wifi/scan ",strlen("GET /api/wifi/scan "))==0){
   if(pending_connect){reply(fd,409,"application/json","{\"error\":\"connection_busy\"}");return true;}
@@ -79,10 +78,10 @@ static bool provision_route(int fd,char *req,size_t used){
   if(!sta_start()||hi_wifi_sta_scan()!=HISI_OK){reply(fd,503,"application/json","{\"error\":\"scan_failed\"}");return true;}
   hi_sleep(3500);
   if(hi_wifi_sta_scan_results(aps,&count)!=HISI_OK){reply(fd,503,"application/json","{\"error\":\"scan_results_failed\"}");return true;}
-  char body[2000];size_t n=snprintf(body,sizeof(body),"{\"aps\":[");
+  size_t n=snprintf(body,body_capacity,"{\"aps\":[");
   if(count>16)count=16;
-  for(unsigned i=0;i<count;i++){char ssid[70];aps[i].ssid[32]=0;quote_json(ssid,sizeof(ssid),aps[i].ssid);n+=snprintf(body+n,sizeof(body)-n,"%s{\"ssid\":%s,\"rssi\":%d}",i?",":"",ssid,aps[i].rssi/100);}
-  snprintf(body+n,sizeof(body)-n,"]}");reply(fd,200,"application/json",body);return true;
+  for(unsigned i=0;i<count;i++){char ssid[70];aps[i].ssid[32]=0;quote_json(ssid,sizeof(ssid),aps[i].ssid);n+=snprintf(body+n,body_capacity-n,"%s{\"ssid\":%s,\"rssi\":%d}",i?",":"",ssid,aps[i].rssi/100);}
+  snprintf(body+n,body_capacity-n,"]}");reply(fd,200,"application/json",body);return true;
  }
  if(strncmp(req,"POST /api/wifi/connect ",strlen("POST /api/wifi/connect "))!=0)return false;
  if(pending_connect){reply(fd,409,"application/json","{\"error\":\"connection_busy\"}");return true;}
@@ -98,7 +97,7 @@ static bool provision_route(int fd,char *req,size_t used){
  if(!headers||!length||length>headers||!strstr(req,"\r\ncontent-type: application/x-www-form-urlencoded\r\n")){reply(fd,400,"application/json","{\"error\":\"invalid_headers\"}");return true;}
  unsigned size=0;if(sscanf(length,"\r\ncontent-length: %u",&size)!=1||size>512){reply(fd,413,"application/json","{\"error\":\"body_too_large\"}");return true;}
  size_t offset=headers+4-req;if(offset+size>=3072){reply(fd,413,"application/json","{}");return true;}
- while(used<offset+size){int n=lwip_recv(fd,req+used,offset+size-used,0);if(n<=0){reply(fd,400,"application/json","{\"error\":\"incomplete_body\"}");return true;}used+=n;}
+ while(used<offset+size){int n=client_recv(fd,req+used,offset+size-used);if(n<=0){reply(fd,400,"application/json","{\"error\":\"incomplete_body\"}");return true;}used+=n;}
  req[offset+size]=0;char ssid[33]={0},key[65]={0};
  bool valid=form_value(req+offset,"ssid",ssid,sizeof(ssid))&&ssid[0]&&utf8_valid(ssid)&&form_value(req+offset,"key",key,sizeof(key))&&(!key[0]||(strlen(key)>=8&&strlen(key)<=63));
  for(size_t i=0;key[i];i++)if((unsigned char)key[i]>126)valid=false;

@@ -1,7 +1,8 @@
-param(
+﻿param(
   [Parameter(Mandatory=$true)][string]$SdkPath,
   [Parameter(Mandatory=$true)][string]$JavaHome,
-  [string]$BuildToolsPath=''
+  [string]$BuildToolsPath='',
+  [switch]$LocalLanDemo
 )
 $ErrorActionPreference='Stop'
 $projectRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -50,6 +51,18 @@ foreach($sdkEntry in Get-ChildItem -LiteralPath $SdkPath -Force){
  }else{Copy-Item -LiteralPath $sdkEntry.FullName -Destination $isolatedSdk -Recurse -Force}
 }
 $utf8=New-Object System.Text.UTF8Encoding($false)
+$output=Join-Path $projectRoot 'output/hap/openharmony7'
+if($LocalLanDemo){
+  $localConfig=Get-Content -LiteralPath 'D:/PenganLocal/cloud-config.json' -Raw | ConvertFrom-Json
+  $credential=Get-Content -LiteralPath 'D:/PenganLocal/device-credential.json' -Raw | ConvertFrom-Json
+  $base=[string]$localConfig.publicOrigin
+  if($base -notmatch '^http://(?:192\.168\.|10\.|172\.(?:1[6-9]|2[0-9]|3[01])\.)[0-9.]+:[0-9]{1,5}$' -or $credential.gatewayId -notmatch '^[A-Za-z0-9_.:-]{1,80}$' -or $credential.token -notmatch '^[A-Za-z0-9_-]{5,256}$'){
+    throw '本机演示参数未通过格式检查'
+  }
+  $output='D:/PenganLocal/private-hap'
+  $localEts=Join-Path $buildRoot 'entry/src/main/ets/model/LocalDemoConfig.ets'
+  $source="export const LOCAL_DEMO_BASE: string = '$base';`nexport const LOCAL_DEMO_ID: string = '$($credential.gatewayId)';`nexport const LOCAL_DEMO_TOKEN: string = '$($credential.token)';`n"
+}
 $writeJson={param($relative,$value) [IO.File]::WriteAllText((Join-Path $buildRoot $relative),($value | ConvertTo-Json -Depth 15),$utf8)}
 $profile=Get-Content -LiteralPath (Join-Path $buildRoot 'build-profile.json5') -Raw | ConvertFrom-Json
 $profile.app.products[0].compileSdkVersion=$api
@@ -65,18 +78,30 @@ $package=Get-Content -LiteralPath (Join-Path $buildRoot 'oh-package.json5') -Raw
 $package.modelVersion=$modelVersion
 & $writeJson 'oh-package.json5' $package
 [IO.File]::WriteAllText((Join-Path $buildRoot 'local.properties'),('sdk.dir='+(Join-Path $buildRoot 'sdk').Replace('\','/')+"`n"),$utf8)
-$output=Join-Path $projectRoot 'output/hap/openharmony7'
 New-Item -ItemType Directory -Force $output | Out-Null
 Push-Location -LiteralPath $buildRoot
 try {
+  if($LocalLanDemo){[IO.File]::WriteAllText($localEts,$source,$utf8)}
   & node 'node_modules/@ohos/hvigor/bin/hvigor.js' --mode module -p product=default -p module=entry@default assembleHap --no-daemon 2>&1 | Tee-Object -FilePath (Join-Path $output 'build-native.log')
   if($LASTEXITCODE -ne 0){throw ('7.0构建失败，保留构建副本：'+$buildRoot)}
   $built=Join-Path $buildRoot 'entry/build/default/outputs/default/entry-default-unsigned.hap'
   if(-not(Test-Path -LiteralPath $built)){throw '未产生HAP，不能报告成功'}
   $sourceAfter=& node (Join-Path $projectRoot 'tools/native-source.mjs') | ConvertFrom-Json
   if($LASTEXITCODE -ne 0 -or $sourceAfter.sha256 -ne $sourceFingerprint.sha256){throw '编译期间原生源码已变化，拒绝发布此候选，请重新构建'}
-  $name='pengan-0.1.0-api'+$api+'-unsigned.hap'
+  $name=if($LocalLanDemo){'pengan-local-lan-api'+$api+'-unsigned.hap'}else{'pengan-0.1.0-api'+$api+'-unsigned.hap'}
   Copy-Item -LiteralPath $built -Destination (Join-Path $output $name) -Force
   [ordered]@{artifact=$name;sha256=(Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash.ToLower();bytes=(Get-Item -LiteralPath $built).Length;builtAt=[DateTimeOffset]::Now.ToString('o');buildDirectory=$buildRoot;bundleName='com.pengan.greenhouse';minApi=$api;targetApi=$api;sdk=$metadata.version;hvigor=$hvigor.version;nativeSourceSha256=$sourceFingerprint.sha256;nativeSourceFiles=$sourceFingerprint.files;signed=$false;installedOnDevice=$false} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'build-manifest.json') -Encoding utf8
   Write-Output ('7.0原生编译成功，未签名：'+(Join-Path $output $name))
-} finally {Pop-Location}
+} finally {
+  Pop-Location
+  if($LocalLanDemo){
+    $expectedTemp=[IO.Path]::GetFullPath($env:TEMP).TrimEnd('\')+'\'
+    $resolvedBuild=(Resolve-Path -LiteralPath $buildRoot).Path
+    if($resolvedBuild.StartsWith($expectedTemp,[StringComparison]::OrdinalIgnoreCase) -and (Split-Path $resolvedBuild -Leaf) -match '^pengan-oh7-[a-f0-9]{12}$'){
+      Get-ChildItem -LiteralPath $resolvedBuild,$isolatedSdk,(Join-Path $isolatedSdk 'ets') -Attributes ReparsePoint | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Force
+      }
+      Remove-Item -LiteralPath $resolvedBuild -Recurse -Force
+    }
+  }
+}
